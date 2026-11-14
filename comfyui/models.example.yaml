@@ -1,0 +1,15 @@
+# 模型下載清單範例（複製到 Google Drive 或本機使用，不要將實際權重 commit 進倉庫）
+# 可搭配 shared.hf_download 讀取 repo_id 與 filename
+
+models:
+  checkpoints:
+    - name: example-sdxl-base
+      repo_id: stabilityai/stable-diffusion-xl-base-1.0
+      filename: sd_xl_base_1.0.safetensors
+      target_subdir: checkpoints
+
+  loras:
+    - name: example-lora
+      repo_id: your-org/your-lora-repo
+      filename: adapter.safetensors
+      target_subdir: loras

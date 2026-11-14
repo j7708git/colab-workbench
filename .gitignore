@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets & local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*token*.txt
+
+# AI models, weights, datasets & outputs
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+models/
+outputs/
+datasets/
+checkpoints/
+
+# Archives & temp files
+*.zip
+*.tar.gz
+*.7z
+.tmp/
+
+# OS & Jupyter
+.DS_Store
+.ipynb_checkpoints/
