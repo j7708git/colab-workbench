@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -199,6 +200,19 @@ class ZeroDiskLaunchTests(unittest.TestCase):
                 self.assertTrue(result.reaper_stop.is_set())
                 fake_tunnel.stop.assert_called_once()
                 fake_proc.terminate.assert_called_once()
+
+
+class NotebookSmokeTests(unittest.TestCase):
+    def test_notebook_step1_supports_branch_parameter(self) -> None:
+        nb_path = Path(__file__).resolve().parents[1] / "comfyui" / "comfyui.ipynb"
+        notebook = json.loads(nb_path.read_text(encoding="utf-8"))
+        cells = {cell.get("id"): cell for cell in notebook.get("cells", [])}
+        self.assertIn("step-1-bootstrap-repo", cells)
+
+        source_text = "".join(cells["step-1-bootstrap-repo"].get("source", []))
+        self.assertIn('BRANCH = "main"  #@param {type:"string"}', source_text)
+        self.assertIn("--branch {BRANCH}", source_text)
+        self.assertIn("fetch origin {BRANCH}", source_text)
 
 
 if __name__ == "__main__":

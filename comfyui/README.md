@@ -4,7 +4,7 @@
 
 ## 檔案說明
 
-- `comfyui.ipynb`：薄入口 Notebook（支援 `Open in Colab` 一鍵開啟）
+- `comfyui.ipynb`：薄入口 Notebook（支援 `Open in Colab` 一鍵開啟；第 1 格提供 `BRANCH` 表單參數，預設 `main`，測試未合併分支時可改填如 `feat/comfyui-zero-disk-bootstrap`）
 - `install.sh`：初始化 `/dev/shm/comfy-out` 與 `/dev/shm/comfy-tmp`、安裝／更新 `/content/ComfyUI`（≥ v0.37.0）及 `huggingface_hub` + `hf_xet`
 - `bootstrap.py`：預設模型清單下載器、RAM Disk 零磁碟指令組裝、過期暫存定期清理（reaper）與 `cloudflared` 隧道整合
 - `models.example.yaml`：預設與選配擴充模型清單範例（僅記錄 repo 與檔名，實際權重不進版控）
