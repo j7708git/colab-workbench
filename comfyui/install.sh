@@ -38,7 +38,7 @@ mkdir -p \
   "$COMFY_DIR/models/loras"
 
 log "Installing Hugging Face Xet transfer tools and YAML parser..."
-pip_install huggingface_hub hf_xet pyyaml
+pip_install --upgrade huggingface_hub hf_xet pyyaml
 
 if [ -f "$COMFY_DIR/requirements.txt" ]; then
   log "Installing ComfyUI Python requirements..."

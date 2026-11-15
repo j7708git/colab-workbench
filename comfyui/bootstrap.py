@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -16,7 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from shared.hf_download import download_hf_file
+from shared.hf_download import download_hf_file, download_hf_repo_files
+from shared.runtime_env import get_secret, get_secret_status
 from shared.tunnel import TunnelProcess, start_cloudflared_tunnel
 
 DEFAULT_COMFY_DIR = Path("/content/ComfyUI")
@@ -265,15 +265,184 @@ def load_models_from_yaml(yaml_path: str | Path) -> list[ModelEntry]:
     return [_entry_from_mapping(item) for item in raw_items if isinstance(item, dict)]
 
 
+def _resolve_hf_token_and_xet(token: str | None) -> str | None:
+    """Resolve HF token once, print auth diagnostics without leaking secrets, and gate Xet concurrency."""
+    raw_token = token if token is not None else get_secret("HF_TOKEN")
+    effective_token = raw_token.strip() if isinstance(raw_token, str) and raw_token.strip() else None
+    has_secret, secret_reason = get_secret_status("HF_TOKEN")
+
+    if effective_token:
+        source_label = "explicit" if token is not None else (secret_reason if has_secret else "env/secret")
+        print(f"[comfyui] HF_TOKEN: authenticated ({source_label})", flush=True)
+        os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    else:
+        reason_label = "explicitly empty" if token is not None else secret_reason
+        print(
+            f"[comfyui] warning: HF_TOKEN unavailable ({reason_label}); downloading anonymously. "
+            "Shared Colab IPs may hit HTTP 429 rate limits—ensure HF_TOKEN is set in Colab Secrets "
+            "with the 'Notebook access' toggle enabled.",
+            flush=True,
+        )
+    return effective_token
+
+
+def _collect_batch_paths(
+    entries: Sequence[ModelEntry],
+    got_paths: Sequence[Path] | None,
+    models_root: Path,
+) -> dict[Path, Path]:
+    if got_paths and len(got_paths) == len(entries):
+        return {
+            entry.dest_rel_path(): Path(got_path)
+            for entry, got_path in zip(entries, got_paths)
+        }
+    return {
+        entry.dest_rel_path(): models_root / entry.dest_rel_path()
+        for entry in entries
+    }
+
+
+def _download_optional_direct_entries(
+    repo_id: str,
+    entries: Sequence[ModelEntry],
+    *,
+    models_root: Path,
+    token: str | None,
+) -> dict[Path, Path]:
+    resolved: dict[Path, Path] = {}
+    if not entries:
+        return resolved
+
+    names = ", ".join(e.name for e in entries)
+    print(
+        f"[comfyui] batch downloading {len(entries)} optional file(s) from {repo_id} ({names})...",
+        flush=True,
+    )
+    if len(entries) > 1:
+        try:
+            got_paths = download_hf_repo_files(
+                repo_id,
+                [e.filename for e in entries],
+                local_dir=models_root,
+                token=token,
+            )
+            return _collect_batch_paths(entries, got_paths, models_root)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[comfyui] warning: optional batch download failed for {repo_id} ({exc}); retrying per file...",
+                flush=True,
+            )
+            for entry in entries:
+                candidate = models_root / entry.dest_rel_path()
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    resolved[entry.dest_rel_path()] = candidate
+
+    for entry in entries:
+        rel = entry.dest_rel_path()
+        if rel in resolved:
+            continue
+        try:
+            got_paths = download_hf_repo_files(
+                repo_id,
+                [entry.filename],
+                local_dir=models_root,
+                token=token,
+            )
+            resolved.update(_collect_batch_paths([entry], got_paths, models_root))
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[comfyui] warning: optional model failed ({entry.name}): {exc}",
+                flush=True,
+            )
+    return resolved
+
+
+def _download_direct_repo_batch(
+    repo_id: str,
+    entries: Sequence[ModelEntry],
+    *,
+    models_root: Path,
+    token: str | None,
+) -> dict[Path, Path]:
+    resolved: dict[Path, Path] = {}
+    required_entries = [e for e in entries if not e.optional]
+    optional_entries = [e for e in entries if e.optional]
+
+    if required_entries:
+        names = ", ".join(e.name for e in required_entries)
+        print(
+            f"[comfyui] batch downloading {len(required_entries)} file(s) from {repo_id} ({names})...",
+            flush=True,
+        )
+        got_paths = download_hf_repo_files(
+            repo_id,
+            [e.filename for e in required_entries],
+            local_dir=models_root,
+            token=token,
+        )
+        resolved.update(_collect_batch_paths(required_entries, got_paths, models_root))
+
+    if optional_entries:
+        resolved.update(
+            _download_optional_direct_entries(
+                repo_id,
+                optional_entries,
+                models_root=models_root,
+                token=token,
+            )
+        )
+
+    return resolved
+
+
+def _download_relocated_entry(
+    entry: ModelEntry,
+    *,
+    models_root: Path,
+    staging_dir: Path,
+    token: str | None,
+) -> Path | None:
+    rel = entry.dest_rel_path()
+    dest = models_root / rel
+    print(f"[comfyui] downloading {entry.name} from {entry.repo_id}...", flush=True)
+    try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = Path(
+            download_hf_file(
+                entry.repo_id,
+                entry.filename,
+                local_dir=staging_dir,
+                token=token,
+            )
+        )
+        if dest.exists() and dest.stat().st_size == 0:
+            dest.unlink()
+        shutil.move(str(tmp_file), str(dest))
+        return dest
+    except Exception as exc:  # noqa: BLE001
+        if entry.optional:
+            print(
+                f"[comfyui] warning: optional model failed ({entry.name}): {exc}",
+                flush=True,
+            )
+            return None
+        raise
+
+
 def download_preset_models(
     comfy_dir: str | Path = DEFAULT_COMFY_DIR,
     *,
     preset: str = "both",
     extra_entries: Iterable[ModelEntry] | None = None,
     token: str | None = None,
+    pause_sec: float = 1.0,
 ) -> list[Path]:
     """Download preset (and optional extra) models into ``<comfy_dir>/models``."""
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    if pause_sec < 0:
+        raise ValueError("pause_sec must be non-negative")
+
+    effective_token = _resolve_hf_token_and_xet(token)
 
     combined: list[ModelEntry] = []
     seen_rel_paths: set[Path] = set()
@@ -285,51 +454,52 @@ def download_preset_models(
 
     models_root = Path(comfy_dir) / "models"
     models_root.mkdir(parents=True, exist_ok=True)
-    downloaded_paths: list[Path] = []
+
+    resolved_by_rel: dict[Path, Path] = {}
+    missing_by_repo: dict[str, list[ModelEntry]] = {}
 
     for entry in combined:
         rel = entry.dest_rel_path()
         dest = models_root / rel
         if dest.is_file() and dest.stat().st_size > 0:
             print(f"[comfyui] already present, skip: {rel}", flush=True)
-            downloaded_paths.append(dest)
+            resolved_by_rel[rel] = dest
             continue
+        missing_by_repo.setdefault(entry.repo_id, []).append(entry)
 
-        print(f"[comfyui] downloading {entry.name} from {entry.repo_id}...", flush=True)
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if Path(entry.filename) == rel:
-                got = Path(
-                    download_hf_file(
-                        entry.repo_id,
-                        entry.filename,
-                        local_dir=models_root,
-                        token=token,
-                    )
-                )
-            else:
-                with tempfile.TemporaryDirectory(dir=models_root, prefix=".hf-dl-") as tmp_dir:
-                    tmp_file = Path(
-                        download_hf_file(
-                            entry.repo_id,
-                            entry.filename,
-                            local_dir=tmp_dir,
-                            token=token,
-                        )
-                    )
-                    shutil.move(str(tmp_file), str(dest))
-                got = dest
-            downloaded_paths.append(got)
-        except Exception as exc:  # noqa: BLE001
-            if entry.optional:
-                print(
-                    f"[comfyui] warning: optional model failed ({entry.name}): {exc}",
-                    flush=True,
-                )
-                continue
-            raise
+    staging_dir = models_root / ".hf-staging"
+    for repo_idx, (repo_id, repo_entries) in enumerate(missing_by_repo.items()):
+        if repo_idx > 0 and pause_sec > 0:
+            time.sleep(pause_sec)
 
-    return downloaded_paths
+        direct_entries = [e for e in repo_entries if Path(e.filename) == e.dest_rel_path()]
+        relocated_entries = [e for e in repo_entries if Path(e.filename) != e.dest_rel_path()]
+
+        if direct_entries:
+            resolved_by_rel.update(
+                _download_direct_repo_batch(
+                    repo_id,
+                    direct_entries,
+                    models_root=models_root,
+                    token=effective_token,
+                )
+            )
+
+        for entry in relocated_entries:
+            got = _download_relocated_entry(
+                entry,
+                models_root=models_root,
+                staging_dir=staging_dir,
+                token=effective_token,
+            )
+            if got is not None:
+                resolved_by_rel[entry.dest_rel_path()] = got
+
+    return [
+        resolved_by_rel[entry.dest_rel_path()]
+        for entry in combined
+        if entry.dest_rel_path() in resolved_by_rel
+    ]
 
 
 def prepare_zero_disk_dirs(shm_root: str | Path = DEFAULT_SHM_ROOT) -> dict[str, Path]:
@@ -356,6 +526,13 @@ def build_comfyui_command(
         raise ValueError(f"Invalid TCP port: {port}")
 
     dirs = prepare_zero_disk_dirs(shm_root)
+    has_cors_arg = bool(
+        extra_args
+        and any(
+            arg == "--enable-cors-header" or arg.startswith("--enable-cors-header=")
+            for arg in extra_args
+        )
+    )
     cmd = [
         python_bin,
         str(Path(comfy_dir) / "main.py"),
@@ -369,6 +546,8 @@ def build_comfyui_command(
         str(dirs["temp"]),
         "--disable-auto-launch",
     ]
+    if not has_cors_arg:
+        cmd.extend(["--enable-cors-header", "*"])
     if extra_args:
         cmd.extend(extra_args)
     return cmd
@@ -379,19 +558,21 @@ def cleanup_expired_files(
     *,
     max_age_sec: float = 300.0,
     now: float | None = None,
+    exclude_names: Iterable[str] | None = None,
 ) -> list[Path]:
     """Delete regular files older than ``max_age_sec`` inside ``target_dirs``."""
     if max_age_sec < 0:
         raise ValueError("max_age_sec must be non-negative")
 
     current_time = time.time() if now is None else now
+    excluded = set(exclude_names or ())
     removed: list[Path] = []
     for raw_dir in target_dirs:
         root = Path(raw_dir)
         if not root.is_dir():
             continue
         for item in root.rglob("*"):
-            if item.is_symlink() or not item.is_file():
+            if item.is_symlink() or not item.is_file() or item.name in excluded:
                 continue
             try:
                 if current_time - item.stat().st_mtime > max_age_sec:
@@ -407,6 +588,7 @@ def start_ramdisk_reaper(
     *,
     max_age_sec: float = 300.0,
     interval_sec: float = 60.0,
+    exclude_names: Iterable[str] | None = None,
 ) -> tuple[threading.Event, threading.Thread]:
     """Start a daemon thread periodically pruning expired files from RAM disk."""
     if max_age_sec < 0:
@@ -415,12 +597,17 @@ def start_ramdisk_reaper(
         raise ValueError("interval_sec must be positive")
 
     dirs = [Path(d) for d in target_dirs]
+    excluded = tuple(exclude_names) if exclude_names else ()
     stop_event = threading.Event()
 
     def _run() -> None:
         while not stop_event.wait(interval_sec):
             try:
-                cleanup_expired_files(dirs, max_age_sec=max_age_sec)
+                cleanup_expired_files(
+                    dirs,
+                    max_age_sec=max_age_sec,
+                    exclude_names=excluded,
+                )
             except OSError:
                 continue
 
@@ -480,6 +667,7 @@ class ZeroDiskLaunchResult:
     comfy_process: subprocess.Popen[str]
     tunnel: TunnelProcess
     reaper_stop: threading.Event
+    log_file: Path = DEFAULT_SHM_ROOT / "comfy-tmp" / "comfyui.log"
 
     def stop(self) -> None:
         """Stop the RAM disk reaper, Cloudflare tunnel, and ComfyUI server."""
@@ -506,6 +694,7 @@ def launch_comfyui_zero_disk(
 ) -> ZeroDiskLaunchResult:
     """Start ComfyUI in zero-disk mode, prune RAM outputs periodically, and expose via tunnel."""
     dirs = prepare_zero_disk_dirs(shm_root)
+    log_file = dirs["temp"] / "comfyui.log"
     cmd = build_comfyui_command(
         comfy_dir,
         shm_root=shm_root,
@@ -518,14 +707,24 @@ def launch_comfyui_zero_disk(
         (dirs["output"], dirs["temp"]),
         max_age_sec=max_age_sec,
         interval_sec=reaper_interval_sec,
+        exclude_names=("comfyui.log",),
     )
-    comfy_proc = subprocess.Popen(
-        cmd,
-        cwd=str(comfy_dir),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    log_fp = None
+    try:
+        log_fp = log_file.open("w", encoding="utf-8")
+        comfy_proc = subprocess.Popen(
+            cmd,
+            cwd=str(comfy_dir),
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        reaper_stop.set()
+        raise
+    finally:
+        if log_fp is not None:
+            log_fp.close()
 
     try:
         local_url = wait_for_local_server(
@@ -551,4 +750,5 @@ def launch_comfyui_zero_disk(
         comfy_process=comfy_proc,
         tunnel=tunnel,
         reaper_stop=reaper_stop,
+        log_file=log_file,
     )

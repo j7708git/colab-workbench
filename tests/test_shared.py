@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 from shared import (
     download_hf_file,
+    download_hf_repo_files,
     download_hf_snapshot,
     ensure_workspace_dirs,
     export_secret_to_env,
     get_secret,
+    get_secret_status,
     is_colab,
     link_dir,
     mount_drive,
@@ -23,6 +28,7 @@ from shared import (
     require_secret,
     start_cloudflared_tunnel,
 )
+from shared.hf_download import _download_resolve_url_fallback, _stream_process_output
 
 
 class SecretsTests(unittest.TestCase):
@@ -67,6 +73,123 @@ class SecretsTests(unittest.TestCase):
     def test_get_secret_rejects_blank_name(self) -> None:
         with self.assertRaises(ValueError):
             get_secret("   ")
+        with self.assertRaises(ValueError):
+            get_secret_status("   ")
+
+    def test_get_secret_warns_on_notebook_access_error_and_status_reports_disabled(self) -> None:
+        class NotebookAccessError(Exception):
+            pass
+
+        fake_colab = types.ModuleType("google.colab")
+        fake_userdata = types.ModuleType("google.colab.userdata")
+
+        def _raise_access(name: str) -> str:
+            raise NotebookAccessError(f"Notebook does not have access to secret {name}")
+
+        fake_userdata.get = _raise_access
+        fake_colab.userdata = fake_userdata
+        fake_google = types.ModuleType("google")
+        fake_google.colab = fake_colab
+
+        stderr_buf = io.StringIO()
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "google": fake_google,
+                    "google.colab": fake_colab,
+                    "google.colab.userdata": fake_userdata,
+                },
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+            contextlib.redirect_stderr(stderr_buf),
+        ):
+            self.assertIsNone(get_secret("HF_TOKEN"))
+            self.assertEqual(
+                get_secret_status("HF_TOKEN"),
+                (False, "notebook-access-disabled"),
+            )
+
+        warn_text = stderr_buf.getvalue()
+        self.assertIn("HF_TOKEN", warn_text)
+        self.assertIn("Notebook access", warn_text)
+
+    def test_get_secret_silent_on_secret_not_found_and_warns_on_timeout(self) -> None:
+        class SecretNotFoundError(Exception):
+            pass
+
+        class TimeoutException(Exception):
+            pass
+
+        fake_colab = types.ModuleType("google.colab")
+        fake_userdata = types.ModuleType("google.colab.userdata")
+        fake_colab.userdata = fake_userdata
+        fake_google = types.ModuleType("google")
+        fake_google.colab = fake_colab
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "google": fake_google,
+                    "google.colab": fake_colab,
+                    "google.colab.userdata": fake_userdata,
+                },
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            fake_userdata.get = mock.Mock(side_effect=SecretNotFoundError("Secret HF_TOKEN does not exist"))
+            missing_stderr = io.StringIO()
+            with contextlib.redirect_stderr(missing_stderr):
+                self.assertIsNone(get_secret("HF_TOKEN"))
+                self.assertEqual(get_secret_status("HF_TOKEN"), (False, "not-set"))
+            self.assertEqual(missing_stderr.getvalue(), "")
+
+            fake_userdata.get = mock.Mock(side_effect=TimeoutException("Request timed out"))
+            timeout_stderr = io.StringIO()
+            with contextlib.redirect_stderr(timeout_stderr):
+                self.assertIsNone(get_secret("HF_TOKEN"))
+                self.assertEqual(get_secret_status("HF_TOKEN"), (False, "colab-secret-timeout"))
+            self.assertIn("Notebook access", timeout_stderr.getvalue())
+
+    def test_get_secret_status_reports_sources_without_leaking_token(self) -> None:
+        fake_colab = types.ModuleType("google.colab")
+        fake_userdata = types.ModuleType("google.colab.userdata")
+        fake_userdata.get = lambda name: "secret-do-not-leak" if name == "HF_TOKEN" else None
+        fake_colab.userdata = fake_userdata
+        fake_google = types.ModuleType("google")
+        fake_google.colab = fake_colab
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "google": fake_google,
+                    "google.colab": fake_colab,
+                    "google.colab.userdata": fake_userdata,
+                },
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            ok, source = get_secret_status("HF_TOKEN")
+            self.assertTrue(ok)
+            self.assertEqual(source, "colab-secret")
+            self.assertNotIn("secret-do-not-leak", source)
+
+        with (
+            mock.patch.dict(sys.modules, {"google.colab": None, "google.colab.userdata": None}),
+            mock.patch.dict(os.environ, {"HF_TOKEN": "env-do-not-leak"}, clear=True),
+        ):
+            ok, source = get_secret_status("HF_TOKEN")
+            self.assertTrue(ok)
+            self.assertEqual(source, "env")
+            self.assertNotIn("env-do-not-leak", source)
+
+        with (
+            mock.patch.dict(sys.modules, {"google.colab": None, "google.colab.userdata": None}),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertEqual(get_secret_status("HF_TOKEN"), (False, "not-set"))
 
 
 class DriveMountTests(unittest.TestCase):
@@ -157,6 +280,363 @@ class HfDownloadTests(unittest.TestCase):
             self.assertEqual(calls[0][1]["token"], "placeholder-token-value")
             self.assertEqual(calls[1][1]["token"], "placeholder-token-value")
             self.assertEqual(calls[1][1]["allow_patterns"], ["*.json"])
+
+    def test_hf_cli_invocation_uses_env_token_and_batches_repo_files(self) -> None:
+        popen_calls: list[tuple[list[str], dict[str, str]]] = []
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append((list(cmd), dict(kwargs["env"])))
+            proc = mock.MagicMock()
+            proc.stdout = io.BytesIO(b"downloading\r100%\n")
+            proc.poll.return_value = 0
+            proc.wait.return_value = 0
+            return proc
+
+        stdout_buf = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("shared.hf_download.shutil.which", return_value="/usr/bin/hf"),
+            mock.patch("shared.hf_download.subprocess.Popen", side_effect=fake_popen),
+            mock.patch.dict(os.environ, {}, clear=True),
+            contextlib.redirect_stdout(stdout_buf),
+        ):
+            single_path = download_hf_file(
+                "org/repo",
+                "model.safetensors",
+                subfolder="/diffusion_models/",
+                revision="rev-1",
+                local_dir=tmp,
+                token="placeholder-cli-token",
+            )
+            batch_paths = download_hf_repo_files(
+                "org/repo",
+                ["text_encoders/enc.safetensors", "vae/vae.safetensors"],
+                local_dir=tmp,
+                token="placeholder-cli-token",
+            )
+
+        self.assertEqual(single_path, Path(tmp) / "diffusion_models" / "model.safetensors")
+        self.assertEqual(
+            batch_paths,
+            [
+                Path(tmp) / "text_encoders" / "enc.safetensors",
+                Path(tmp) / "vae" / "vae.safetensors",
+            ],
+        )
+        self.assertEqual(len(popen_calls), 2)
+
+        cmd1, env1 = popen_calls[0]
+        self.assertEqual(
+            cmd1,
+            [
+                "/usr/bin/hf",
+                "download",
+                "org/repo",
+                "diffusion_models/model.safetensors",
+                "--local-dir",
+                tmp,
+                "--revision",
+                "rev-1",
+            ],
+        )
+        self.assertNotIn("--token", cmd1)
+        self.assertNotIn("placeholder-cli-token", " ".join(cmd1))
+        self.assertEqual(env1.get("HF_TOKEN"), "placeholder-cli-token")
+        self.assertNotIn("HF_XET_HIGH_PERFORMANCE", env1)
+
+        cmd2, env2 = popen_calls[1]
+        self.assertEqual(
+            cmd2,
+            [
+                "/usr/bin/hf",
+                "download",
+                "org/repo",
+                "text_encoders/enc.safetensors",
+                "vae/vae.safetensors",
+                "--local-dir",
+                tmp,
+            ],
+        )
+        self.assertNotIn("--token", cmd2)
+        self.assertEqual(env2.get("HF_TOKEN"), "placeholder-cli-token")
+        self.assertIn("downloading", stdout_buf.getvalue())
+
+    def test_429_retry_parses_retry_after_and_degrades_xet_cli_and_python(self) -> None:
+        cli_envs: list[dict[str, str]] = []
+        cli_outputs = [
+            (1, b"HTTP 429 Too Many Requests\nRetry-After: 7\n"),
+            (1, b"Rate limit hit. Retry after 15 seconds.\n"),
+            (0, b"done\n"),
+        ]
+
+        def fake_popen(cmd, **kwargs):
+            cli_envs.append(dict(kwargs["env"]))
+            rc, payload = cli_outputs.pop(0)
+            proc = mock.MagicMock()
+            proc.stdout = io.BytesIO(payload)
+            proc.poll.return_value = rc
+            proc.wait.return_value = rc
+            return proc
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("shared.hf_download.shutil.which", return_value="/usr/bin/hf"),
+            mock.patch("shared.hf_download.subprocess.Popen", side_effect=fake_popen),
+            mock.patch("shared.hf_download.time.sleep") as sleep_mock,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            got = download_hf_file(
+                "org/repo",
+                "m.safetensors",
+                local_dir=tmp,
+                max_retries=5,
+                initial_backoff_sec=5.0,
+            )
+
+        self.assertEqual(got, Path(tmp) / "m.safetensors")
+        self.assertEqual(len(cli_envs), 3)
+        self.assertNotIn("HF_XET_HIGH_PERFORMANCE", cli_envs[0])
+        self.assertNotIn("HF_HUB_DISABLE_XET", cli_envs[0])
+        self.assertEqual(cli_envs[1].get("HF_XET_HIGH_PERFORMANCE"), "0")
+        self.assertNotIn("HF_HUB_DISABLE_XET", cli_envs[1])
+        self.assertEqual(cli_envs[2].get("HF_XET_HIGH_PERFORMANCE"), "0")
+        self.assertEqual(cli_envs[2].get("HF_HUB_DISABLE_XET"), "1")
+        self.assertEqual(
+            [c.args[0] for c in sleep_mock.call_args_list],
+            [8.0, 16.0],
+        )
+
+        # Verify Python hub path exponential backoff (5 -> 10 -> 20 -> 40 -> 60) + Xet downgrade
+        fake_hf = types.ModuleType("huggingface_hub")
+        py_envs: list[tuple[str | None, str | None]] = []
+
+        class FakeResponse:
+            def __init__(self, status_code: int, headers: dict[str, str] | None = None):
+                self.status_code = status_code
+                self.headers = headers or {}
+
+        class FakeHubError(Exception):
+            def __init__(self, msg: str, status_code: int):
+                super().__init__(msg)
+                self.response = FakeResponse(status_code)
+
+        def fake_snapshot_download(**kwargs):
+            py_envs.append(
+                (
+                    os.environ.get("HF_XET_HIGH_PERFORMANCE"),
+                    os.environ.get("HF_HUB_DISABLE_XET"),
+                )
+            )
+            if len(py_envs) <= 5:
+                raise FakeHubError("429 Too Many Requests", 429)
+            return kwargs["local_dir"]
+
+        fake_hf.snapshot_download = fake_snapshot_download
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, {"huggingface_hub": fake_hf}),
+            mock.patch("shared.hf_download.time.sleep") as py_sleep_mock,
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            paths = download_hf_repo_files(
+                "org/repo",
+                ["a.bin", "b.bin"],
+                local_dir=tmp,
+                max_retries=5,
+                initial_backoff_sec=5.0,
+            )
+            self.assertNotIn("HF_XET_HIGH_PERFORMANCE", os.environ)
+            self.assertNotIn("HF_HUB_DISABLE_XET", os.environ)
+
+        self.assertEqual(paths, [Path(tmp) / "a.bin", Path(tmp) / "b.bin"])
+        self.assertEqual(
+            [c.args[0] for c in py_sleep_mock.call_args_list],
+            [5.0, 10.0, 20.0, 40.0, 60.0],
+        )
+        self.assertEqual(py_envs[0], (None, None))
+        self.assertEqual(py_envs[1], ("0", None))
+        self.assertEqual(py_envs[2], ("0", "1"))
+
+    def test_download_hf_file_exhausted_429_uses_fallback_and_404_fails_fast(self) -> None:
+        def always_429(cmd, **kwargs):
+            proc = mock.MagicMock()
+            proc.stdout = io.BytesIO(b"429 Too Many Requests\n")
+            proc.poll.return_value = 1
+            proc.wait.return_value = 1
+            return proc
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("shared.hf_download.shutil.which", return_value="/usr/bin/hf"),
+            mock.patch("shared.hf_download.subprocess.Popen", side_effect=always_429),
+            mock.patch("shared.hf_download.time.sleep"),
+            mock.patch(
+                "shared.hf_download._download_resolve_url_fallback",
+                return_value=Path(tmp) / "m.bin",
+            ) as fb_mock,
+        ):
+            out = download_hf_file(
+                "org/repo",
+                "m.bin",
+                local_dir=tmp,
+                max_retries=1,
+                initial_backoff_sec=0.0,
+                token="tok-abc",
+            )
+            self.assertEqual(out, Path(tmp) / "m.bin")
+            fb_mock.assert_called_once()
+
+        def fail_404(cmd, **kwargs):
+            proc = mock.MagicMock()
+            proc.stdout = io.BytesIO(b"404 Not Found: https://huggingface.co/org/model-429/resolve/main/m.bin\n")
+            proc.poll.return_value = 1
+            proc.wait.return_value = 1
+            return proc
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("shared.hf_download.shutil.which", return_value="/usr/bin/hf"),
+            mock.patch("shared.hf_download.subprocess.Popen", side_effect=fail_404) as popen_mock,
+            mock.patch("shared.hf_download._download_resolve_url_fallback") as fb_mock,
+        ):
+            with self.assertRaises(RuntimeError):
+                download_hf_file("org/model-429", "m.bin", local_dir=tmp, max_retries=3)
+            self.assertEqual(popen_mock.call_count, 1)
+            fb_mock.assert_not_called()
+
+    def test_download_resolve_url_fallback_atomic_part_and_failure_safety(self) -> None:
+        class _FakeHTTPResponse:
+            def __init__(self, status: int, chunks: list[bytes], headers: dict[str, str]):
+                self.status = status
+                self._chunks = list(chunks)
+                self.headers = headers
+
+            def read(self, _n: int = -1) -> bytes:
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        # 1. Range resume from existing .part -> atomic replace to target
+        requests_seen: list[tuple[str, dict[str, str]]] = []
+
+        def fake_urlopen_resume(req, timeout=60.0):
+            requests_seen.append((req.full_url, dict(req.header_items())))
+            return _FakeHTTPResponse(206, [b"world"], {"Content-Length": "5"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "models" / "test.safetensors"
+            part = target.with_name(target.name + ".part")
+            part.parent.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(b"hello ")
+
+            with (
+                mock.patch("shared.hf_download.shutil.which", return_value=None),
+                mock.patch("shared.hf_download.urllib.request.urlopen", side_effect=fake_urlopen_resume),
+            ):
+                got = _download_resolve_url_fallback(
+                    "org/repo",
+                    "models/test.safetensors",
+                    target,
+                    revision="main",
+                    token="tok-fallback",
+                )
+
+            self.assertEqual(got, target)
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_bytes(), b"hello world")
+            self.assertFalse(part.exists())
+            url, hdrs = requests_seen[0]
+            self.assertEqual(url, "https://huggingface.co/org/repo/resolve/main/models/test.safetensors")
+            hdrs_lower = {k.lower(): v for k, v in hdrs.items()}
+            self.assertEqual(hdrs_lower.get("authorization"), "Bearer tok-fallback")
+            self.assertEqual(hdrs_lower.get("range"), "bytes=6-")
+
+        # 2. Truncated stream MUST NOT create final target
+        def fake_urlopen_truncated(req, timeout=60.0):
+            return _FakeHTTPResponse(200, [b"partial"], {"Content-Length": "100"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "broken.safetensors"
+            part = target.with_name(target.name + ".part")
+            with (
+                mock.patch("shared.hf_download.shutil.which", return_value=None),
+                mock.patch("shared.hf_download.urllib.request.urlopen", side_effect=fake_urlopen_truncated),
+            ):
+                with self.assertRaises(OSError):
+                    _download_resolve_url_fallback("org/repo", "broken.safetensors", target)
+
+            self.assertFalse(target.exists())
+            self.assertTrue(part.is_file())
+            self.assertEqual(part.read_bytes(), b"partial")
+
+        # 3. HTTP 429 on fallback MUST NOT create final target
+        def fake_urlopen_429(req, timeout=60.0):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "rate_limited.safetensors"
+            with (
+                mock.patch("shared.hf_download.shutil.which", return_value=None),
+                mock.patch("shared.hf_download.urllib.request.urlopen", side_effect=fake_urlopen_429),
+            ):
+                with self.assertRaises(urllib.error.HTTPError):
+                    _download_resolve_url_fallback("org/repo", "rate_limited.safetensors", target)
+            self.assertFalse(target.exists())
+
+        # 4. wget -c path writes to .part and never creates target on failure
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "via_wget.safetensors"
+            part = target.with_name(target.name + ".part")
+
+            def fake_wget_ok(cmd, check=False):
+                self.assertIn("-c", cmd)
+                self.assertEqual(cmd[cmd.index("-O") + 1], str(part))
+                self.assertFalse(target.exists())
+                part.write_bytes(b"wget-payload")
+                return mock.MagicMock(returncode=0)
+
+            with (
+                mock.patch("shared.hf_download.shutil.which", side_effect=lambda b: "/usr/bin/wget" if b == "wget" else None),
+                mock.patch("shared.hf_download.subprocess.run", side_effect=fake_wget_ok),
+            ):
+                got = _download_resolve_url_fallback("org/repo", "via_wget.safetensors", target)
+            self.assertEqual(got, target)
+            self.assertEqual(target.read_bytes(), b"wget-payload")
+            self.assertFalse(part.exists())
+
+            target_fail = Path(tmp) / "via_wget_fail.safetensors"
+            part_fail = target_fail.with_name(target_fail.name + ".part")
+
+            def fake_wget_fail(cmd, check=False):
+                part_fail.write_bytes(b"partial-wget")
+                return mock.MagicMock(returncode=8)
+
+            with (
+                mock.patch("shared.hf_download.shutil.which", side_effect=lambda b: "/usr/bin/wget" if b == "wget" else None),
+                mock.patch("shared.hf_download.subprocess.run", side_effect=fake_wget_fail),
+            ):
+                with self.assertRaises(RuntimeError):
+                    _download_resolve_url_fallback("org/repo", "via_wget_fail.safetensors", target_fail)
+            self.assertFalse(target_fail.exists())
+            self.assertTrue(part_fail.is_file())
+
+    def test_stream_process_output_real_subprocess(self) -> None:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc, tail = _stream_process_output(
+                [sys.executable, "-c", "import sys; sys.stdout.write('step 1\\rstep 2\\n')"],
+                env=os.environ.copy(),
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("step 2", tail)
+        self.assertIn("step 2", buf.getvalue())
 
 
 class TunnelTests(unittest.TestCase):

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -58,21 +62,42 @@ class ModelPresetTests(unittest.TestCase):
 
 
 class ModelDownloadTests(unittest.TestCase):
-    def test_download_preset_models_downloads_skips_and_handles_optional(self) -> None:
-        calls: list[tuple[str, str, str, str | None]] = []
+    def test_download_preset_models_batches_by_repo_skips_existing_and_handles_optional(self) -> None:
+        batch_calls: list[tuple[str, list[str], str, str | None]] = []
+        file_calls: list[tuple[str, str, str, str | None]] = []
 
-        def fake_download(repo_id: str, filename: str, *, local_dir, token=None, **kwargs):
-            calls.append((repo_id, filename, str(local_dir), token))
-            if "fail-optional" in filename:
-                raise RuntimeError("transient network error")
+        def fake_repo_download(repo_id: str, filenames, *, local_dir, token=None, **kwargs):
+            file_list = list(filenames)
+            batch_calls.append((repo_id, file_list, str(local_dir), token))
+            paths: list[Path] = []
+            for fname in file_list:
+                if "fail-optional" in fname:
+                    raise RuntimeError("transient network error")
+                out_path = Path(local_dir) / fname
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(b"weights")
+                paths.append(out_path)
+            return paths
+
+        def fake_file_download(repo_id: str, filename: str, *, local_dir, token=None, **kwargs):
+            file_calls.append((repo_id, filename, str(local_dir), token))
             out_path = Path(local_dir) / filename
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(b"weights")
+            out_path.write_bytes(b"relocated-weights")
             return out_path
+
+        clean_env = dict(os.environ)
+        clean_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+        buf = io.StringIO()
 
         with (
             tempfile.TemporaryDirectory() as tmp,
-            mock.patch("comfyui.bootstrap.download_hf_file", side_effect=fake_download),
+            mock.patch.dict(os.environ, clean_env, clear=True),
+            mock.patch("comfyui.bootstrap.download_hf_repo_files", side_effect=fake_repo_download),
+            mock.patch("comfyui.bootstrap.download_hf_file", side_effect=fake_file_download),
+            mock.patch("comfyui.bootstrap.get_secret_status", return_value=(False, "not-set")),
+            mock.patch("comfyui.bootstrap.time.sleep") as sleep_mock,
+            redirect_stdout(buf),
         ):
             comfy_dir = Path(tmp) / "ComfyUI"
             existing = (
@@ -85,6 +110,13 @@ class ModelDownloadTests(unittest.TestCase):
             existing.write_bytes(b"already-downloaded")
 
             extras = [
+                ModelEntry(
+                    name="required-lora",
+                    repo_id="org/repo",
+                    filename="loras/required.safetensors",
+                    target_subdir="loras",
+                    optional=False,
+                ),
                 ModelEntry(
                     name="optional-lora",
                     repo_id="org/repo",
@@ -105,13 +137,143 @@ class ModelDownloadTests(unittest.TestCase):
                 preset="qwen21_turbo_int8",
                 extra_entries=extras,
                 token="placeholder-token",
+                pause_sec=1.0,
             )
 
-            self.assertEqual(len(got), 4)
-            self.assertEqual(len(calls), 4)
-            self.assertFalse(any("qwen_image_2.1_vae_bf16" in c[1] for c in calls))
+            self.assertEqual(len(got), 5)
+            # 1 batch call for Comfy-Org/Qwen-Image-2.1 (2 missing files),
+            # 1 required batch call for org/repo, 1 optional call for org/repo.
+            self.assertEqual(len(batch_calls), 3)
+            self.assertEqual(batch_calls[0][0], "Comfy-Org/Qwen-Image-2.1")
+            self.assertEqual(
+                batch_calls[0][1],
+                [
+                    "diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors",
+                    "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+                ],
+            )
+            self.assertEqual(batch_calls[1][0], "org/repo")
+            self.assertEqual(batch_calls[1][1], ["loras/required.safetensors"])
+            self.assertEqual(batch_calls[2][0], "org/repo")
+            self.assertEqual(batch_calls[2][1], ["loras/fail-optional.safetensors"])
+            self.assertFalse(
+                any("qwen_image_2.1_vae_bf16" in fname for _, files, _, _ in batch_calls for fname in files)
+            )
+
+            self.assertEqual(len(file_calls), 1)
+            self.assertEqual(file_calls[0][0], "org/repo")
+            self.assertEqual(file_calls[0][1], "nested/custom.safetensors")
+            expected_staging = comfy_dir / "models" / ".hf-staging"
+            self.assertEqual(Path(file_calls[0][2]), expected_staging)
+            self.assertTrue(expected_staging.is_dir())
             self.assertTrue((comfy_dir / "models" / "loras" / "custom.safetensors").is_file())
-            self.assertEqual(calls[0][3], "placeholder-token")
+
+            self.assertEqual(batch_calls[0][3], "placeholder-token")
+            self.assertEqual(file_calls[0][3], "placeholder-token")
+            self.assertEqual(os.environ.get("HF_XET_HIGH_PERFORMANCE"), "1")
+            sleep_mock.assert_called_once_with(1.0)
+            self.assertNotIn("placeholder-token", buf.getvalue())
+
+    def test_download_preset_models_skips_xet_high_perf_without_token_and_pauses_only_if_positive(self) -> None:
+        batch_calls: list[tuple[str, list[str], str | None]] = []
+
+        def fake_repo_download(repo_id: str, filenames, *, local_dir, token=None, **kwargs):
+            file_list = list(filenames)
+            batch_calls.append((repo_id, file_list, token))
+            paths: list[Path] = []
+            for fname in file_list:
+                out_path = Path(local_dir) / fname
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(b"weights")
+                paths.append(out_path)
+            return paths
+
+        clean_env = dict(os.environ)
+        clean_env.pop("HF_TOKEN", None)
+        clean_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+        buf = io.StringIO()
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, clean_env, clear=True),
+            mock.patch("comfyui.bootstrap.get_secret", return_value=None),
+            mock.patch(
+                "comfyui.bootstrap.get_secret_status",
+                return_value=(False, "notebook-access-disabled"),
+            ),
+            mock.patch("comfyui.bootstrap.download_hf_repo_files", side_effect=fake_repo_download),
+            mock.patch("comfyui.bootstrap.time.sleep") as sleep_mock,
+            redirect_stdout(buf),
+        ):
+            comfy_dir = Path(tmp) / "ComfyUI"
+            got = download_preset_models(comfy_dir, preset="both", pause_sec=0.0)
+
+            self.assertEqual(len(got), 7)
+            self.assertEqual(
+                [repo for repo, _, _ in batch_calls],
+                [
+                    "Comfy-Org/Qwen-Image-2.1",
+                    "Comfy-Org/MOSS-Image",
+                    "Kijai/MOSS-image_experimental",
+                ],
+            )
+            self.assertTrue(all(tok is None for _, _, tok in batch_calls))
+            self.assertNotIn("HF_XET_HIGH_PERFORMANCE", os.environ)
+            sleep_mock.assert_not_called()
+            output = buf.getvalue()
+            self.assertIn("notebook-access-disabled", output)
+            self.assertIn("Notebook access", output)
+
+    def test_download_preset_models_multiple_optional_batch_falls_back_per_file(self) -> None:
+        def fake_repo_download(repo_id: str, filenames, *, local_dir, token=None, **kwargs):
+            file_list = list(filenames)
+            if len(file_list) > 1:
+                raise RuntimeError("batch 404 on optional file")
+            if "bad" in file_list[0]:
+                raise RuntimeError("missing optional file")
+            out_path = Path(local_dir) / file_list[0]
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"ok")
+            return [out_path]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("comfyui.bootstrap.download_hf_repo_files", side_effect=fake_repo_download),
+            mock.patch("comfyui.bootstrap.get_secret_status", return_value=(False, "not-set")),
+        ):
+            comfy_dir = Path(tmp) / "ComfyUI"
+            extras = [
+                ModelEntry(
+                    name="opt-good",
+                    repo_id="org/opt",
+                    filename="loras/good.safetensors",
+                    target_subdir="loras",
+                    optional=True,
+                ),
+                ModelEntry(
+                    name="opt-bad",
+                    repo_id="org/opt",
+                    filename="loras/bad.safetensors",
+                    target_subdir="loras",
+                    optional=True,
+                ),
+            ]
+            # Use empty existing preset? Make all preset files exist first so only extras download.
+            for entry in resolve_model_preset("qwen21_turbo_int8"):
+                p = comfy_dir / "models" / entry.dest_rel_path()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"preset")
+
+            got = download_preset_models(
+                comfy_dir,
+                preset="qwen21_turbo_int8",
+                extra_entries=extras,
+                token="tok",
+                pause_sec=0.0,
+            )
+            self.assertEqual(len(got), 4)
+            self.assertTrue((comfy_dir / "models" / "loras" / "good.safetensors").is_file())
+            self.assertFalse((comfy_dir / "models" / "loras" / "bad.safetensors").exists())
 
 
 class ZeroDiskLaunchTests(unittest.TestCase):
@@ -134,7 +296,26 @@ class ZeroDiskLaunchTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--output-directory") + 1], str(dirs["output"]))
             self.assertEqual(cmd[cmd.index("--temp-directory") + 1], str(dirs["temp"]))
             self.assertIn("--disable-auto-launch", cmd)
+            cors_idx = cmd.index("--enable-cors-header")
+            self.assertEqual(cmd[cors_idx + 1], "*")
             self.assertEqual(cmd[-1], "--lowvram")
+
+            cmd_explicit_sep = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                extra_args=["--enable-cors-header", "https://example.com"],
+            )
+            self.assertEqual(cmd_explicit_sep.count("--enable-cors-header"), 1)
+            self.assertNotIn("*", cmd_explicit_sep)
+
+            cmd_explicit_eq = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                extra_args=["--enable-cors-header=https://example.com"],
+            )
+            self.assertNotIn("--enable-cors-header", cmd_explicit_eq)
+            self.assertIn("--enable-cors-header=https://example.com", cmd_explicit_eq)
+            self.assertNotIn("*", cmd_explicit_eq)
 
             with self.assertRaises(ValueError):
                 build_comfyui_command("/content/ComfyUI", shm_root=shm_root, port=0)
@@ -147,16 +328,30 @@ class ZeroDiskLaunchTests(unittest.TestCase):
 
             old_file = nested / "old.png"
             fresh_file = out_dir / "fresh.png"
+            log_file = out_dir / "comfyui.log"
             old_file.write_bytes(b"old")
             fresh_file.write_bytes(b"fresh")
+            log_file.write_bytes(b"server log")
 
             now = 1_700_000_000.0
             os.utime(old_file, (now - 600, now - 600))
             os.utime(fresh_file, (now - 30, now - 30))
+            os.utime(log_file, (now - 900, now - 900))
 
-            removed = cleanup_expired_files([out_dir], max_age_sec=300.0, now=now)
+            removed = cleanup_expired_files(
+                [out_dir],
+                max_age_sec=300.0,
+                now=now,
+                exclude_names=("comfyui.log",),
+            )
             self.assertEqual(removed, [old_file])
             self.assertFalse(old_file.exists())
+            self.assertTrue(fresh_file.exists())
+            self.assertTrue(log_file.exists())
+
+            removed_unfiltered = cleanup_expired_files([out_dir], max_age_sec=300.0, now=now)
+            self.assertEqual(removed_unfiltered, [log_file])
+            self.assertFalse(log_file.exists())
             self.assertTrue(fresh_file.exists())
 
             with self.assertRaises(ValueError):
@@ -176,7 +371,12 @@ class ZeroDiskLaunchTests(unittest.TestCase):
             fake_tunnel = mock.MagicMock()
             fake_tunnel.url = "https://zero-disk-test.trycloudflare.com"
 
+            reaper_stop = threading.Event()
             with (
+                mock.patch(
+                    "comfyui.bootstrap.start_ramdisk_reaper",
+                    return_value=(reaper_stop, mock.MagicMock()),
+                ) as reaper_mock,
                 mock.patch("comfyui.bootstrap.subprocess.Popen", return_value=fake_proc) as popen_mock,
                 mock.patch("comfyui.bootstrap.wait_for_local_server", return_value="http://127.0.0.1:8188"),
                 mock.patch("comfyui.bootstrap.start_cloudflared_tunnel", return_value=fake_tunnel) as tunnel_mock,
@@ -188,20 +388,66 @@ class ZeroDiskLaunchTests(unittest.TestCase):
                     reaper_interval_sec=60.0,
                 )
 
+                self.assertEqual(
+                    reaper_mock.call_args.kwargs.get("exclude_names"),
+                    ("comfyui.log",),
+                )
+
                 self.assertEqual(result.public_url, "https://zero-disk-test.trycloudflare.com")
                 self.assertEqual(result.local_url, "http://127.0.0.1:8188")
                 self.assertEqual(result.output_dir, shm_root / "comfy-out")
                 self.assertEqual(result.temp_dir, shm_root / "comfy-tmp")
+                expected_log = shm_root / "comfy-tmp" / "comfyui.log"
+                self.assertEqual(result.log_file, expected_log)
+                self.assertTrue(expected_log.is_file())
 
                 launched_cmd = popen_mock.call_args[0][0]
                 self.assertIn(str(shm_root / "comfy-out"), launched_cmd)
                 self.assertIn(str(shm_root / "comfy-tmp"), launched_cmd)
+                self.assertIn("--enable-cors-header", launched_cmd)
+                popen_kwargs = popen_mock.call_args.kwargs
+                log_fp = popen_kwargs["stdout"]
+                self.assertEqual(Path(log_fp.name), expected_log)
+                self.assertTrue(log_fp.closed)
+                self.assertEqual(popen_kwargs["stderr"], subprocess.STDOUT)
                 tunnel_mock.assert_called_once()
 
                 result.stop()
                 self.assertTrue(result.reaper_stop.is_set())
                 fake_tunnel.stop.assert_called_once()
                 fake_proc.terminate.assert_called_once()
+
+    def test_launch_comfyui_zero_disk_closes_log_fd_when_popen_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            comfy_dir = root / "ComfyUI"
+            comfy_dir.mkdir()
+            shm_root = root / "shm"
+            captured_fps: list[object] = []
+            reaper_stop = threading.Event()
+
+            def fail_popen(*args, **kwargs):
+                captured_fps.append(kwargs.get("stdout"))
+                raise OSError("popen failed")
+
+            with (
+                mock.patch(
+                    "comfyui.bootstrap.start_ramdisk_reaper",
+                    return_value=(reaper_stop, mock.MagicMock()),
+                ),
+                mock.patch("comfyui.bootstrap.subprocess.Popen", side_effect=fail_popen),
+                self.assertRaises(OSError),
+            ):
+                launch_comfyui_zero_disk(
+                    comfy_dir,
+                    shm_root=shm_root,
+                    port=8188,
+                    reaper_interval_sec=60.0,
+                )
+
+            self.assertEqual(len(captured_fps), 1)
+            self.assertTrue(captured_fps[0].closed)
+            self.assertTrue(reaper_stop.is_set())
 
 
 class NotebookSmokeTests(unittest.TestCase):
@@ -220,6 +466,19 @@ class NotebookSmokeTests(unittest.TestCase):
         self.assertIn("importlib.invalidate_caches()", step1_source)
         self.assertIn("sys.modules", step1_source)
         self.assertIn("comfyui/__init__.py", step1_source)
+        self.assertIn('get_secret_status("HF_TOKEN")', step1_source)
+        self.assertIn("Notebook access", step1_source)
+
+        step3_source = "".join(cells["step-3-download-models"].get("source", []))
+        self.assertIn('get_secret_status("HF_TOKEN")', step3_source)
+        self.assertIn("hf download", step3_source)
+        self.assertIn("429", step3_source)
+
+        step4_source = "".join(cells["step-4-launch-zero-disk"].get("source", []))
+        self.assertIn("ComfyUI Log:", step4_source)
+        self.assertIn("session.log_file", step4_source)
+        self.assertIn("--enable-cors-header *", step4_source)
+        self.assertIn("403", step4_source)
 
         for cell_id in ("step-3-download-models", "step-4-launch-zero-disk"):
             cell_source = "".join(cells[cell_id].get("source", []))
