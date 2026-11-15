@@ -501,7 +501,8 @@ class NotebookSmokeTests(unittest.TestCase):
         self.assertIn("step-4-launch-zero-disk", cells)
 
         step1_source = "".join(cells["step-1-bootstrap-repo"].get("source", []))
-        self.assertIn('BRANCH = "feat/comfyui-zero-disk-bootstrap"  #@param {type:"string"}', step1_source)
+        self.assertIn('FALLBACK_BRANCH = "main"', step1_source)
+        self.assertIn('BRANCH = "main"  #@param {type:"string"}', step1_source)
         self.assertIn("+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}", step1_source)
         self.assertIn('"checkout", "-B", BRANCH, f"origin/{BRANCH}"', step1_source)
         self.assertIn("importlib.invalidate_caches()", step1_source)
