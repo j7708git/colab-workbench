@@ -1,15 +1,51 @@
-# 模型下載清單範例（複製到 Google Drive 或本機使用，不要將實際權重 commit 進倉庫）
-# 可搭配 shared.hf_download 讀取 repo_id 與 filename
+# 模型下載清單範例（複製後配合 comfyui.bootstrap.load_models_from_yaml 使用，勿將實際權重 commit 進倉庫）
+# 下列兩組為內建預設集（皆位於 Hugging Face 公開倉庫，開箱即用）：
+#   - qwen21_turbo_int8（約 17.3 GB）
+#   - moss_sft_int8（約 16.2 GB，含 4 步蒸餾加速 LoRA）
 
 models:
-  checkpoints:
-    - name: example-sdxl-base
-      repo_id: stabilityai/stable-diffusion-xl-base-1.0
-      filename: sd_xl_base_1.0.safetensors
-      target_subdir: checkpoints
+  qwen21_turbo_int8:
+    - name: qwen2.1-turbo-int8-diffusion
+      repo_id: Comfy-Org/Qwen-Image-2.1
+      filename: diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors
+      target_subdir: diffusion_models
 
-  loras:
-    - name: example-lora
-      repo_id: your-org/your-lora-repo
-      filename: adapter.safetensors
+    - name: qwen3vl-8b-int8-text-encoder
+      repo_id: Comfy-Org/Qwen-Image-2.1
+      filename: text_encoders/qwen3vl_8b_int8_convrot.safetensors
+      target_subdir: text_encoders
+
+    - name: qwen2.1-vae-bf16
+      repo_id: Comfy-Org/Qwen-Image-2.1
+      filename: vae/qwen_image_2.1_vae_bf16.safetensors
+      target_subdir: vae
+
+  moss_sft_int8:
+    - name: moss-image-sft-int8-diffusion
+      repo_id: Comfy-Org/MOSS-Image
+      filename: diffusion_models/moss_image_sft_int8_convrot.safetensors
+      target_subdir: diffusion_models
+
+    - name: qwen3.5-9b-int8-text-encoder
+      repo_id: Comfy-Org/MOSS-Image
+      filename: text_encoders/qwen3.5_9b_int8_convrot.safetensors
+      target_subdir: text_encoders
+
+    - name: flux2-vae
+      repo_id: Comfy-Org/MOSS-Image
+      filename: vae/flux2-vae.safetensors
+      target_subdir: vae
+
+    - name: moss-image-sft-4steps-lora
+      repo_id: Kijai/MOSS-image_experimental
+      filename: loras/moss_image_sft_4_steps_lora_v2_600_avg_rank_72_bf16.safetensors
       target_subdir: loras
+
+  # 選配：若需於 Colab 額外載入自訂私有 LoRA，請於 Colab Secrets 設定 HF_TOKEN，
+  # 並複製一份 YAML（不要推上 public repo）填入以下結構：
+  # custom_loras:
+  #   - name: custom-lora
+  #     repo_id: <your-org>/<your-lora-repo>
+  #     filename: loras/adapter.safetensors
+  #     target_subdir: loras
+  #     optional: true

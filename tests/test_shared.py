@@ -84,7 +84,12 @@ class DriveMountTests(unittest.TestCase):
             link = root / "app" / "models"
             link.mkdir(parents=True)
 
-            created = link_dir(target, link)
+            try:
+                created = link_dir(target, link)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege not enabled (WinError 1314)")
+                raise
             self.assertTrue(created.is_symlink())
             self.assertEqual(created.resolve(), target.resolve())
 
@@ -103,7 +108,12 @@ class DriveMountTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 link_dir(target, link)
 
-            replaced = link_dir(target, link, force=True)
+            try:
+                replaced = link_dir(target, link, force=True)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege not enabled (WinError 1314)")
+                raise
             self.assertTrue(replaced.is_symlink())
             self.assertEqual(replaced.resolve(), target.resolve())
 
@@ -160,16 +170,27 @@ class TunnelTests(unittest.TestCase):
 
     def test_start_cloudflared_tunnel_parses_url_and_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            fake_bin = Path(tmp) / "cloudflared"
-            fake_bin.write_text(
-                "#!/usr/bin/env python3\n"
-                "import sys, time\n"
-                "print('starting tunnel', flush=True)\n"
-                "print('https://demo-unit-test.trycloudflare.com', flush=True)\n"
-                "time.sleep(10)\n",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+            if os.name == "nt":
+                fake_bin = Path(tmp) / "cloudflared.cmd"
+                fake_bin.write_text(
+                    "@echo off\r\n"
+                    f'"{sys.executable}" -u -c "import time; '
+                    "print('starting tunnel', flush=True); "
+                    "print('https://demo-unit-test.trycloudflare.com', flush=True); "
+                    'time.sleep(1)"\r\n',
+                    encoding="utf-8",
+                )
+            else:
+                fake_bin = Path(tmp) / "cloudflared"
+                fake_bin.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import sys, time\n"
+                    "print('starting tunnel', flush=True)\n"
+                    "print('https://demo-unit-test.trycloudflare.com', flush=True)\n"
+                    "time.sleep(10)\n",
+                    encoding="utf-8",
+                )
+                fake_bin.chmod(0o755)
 
             tunnel = start_cloudflared_tunnel(
                 8188,
