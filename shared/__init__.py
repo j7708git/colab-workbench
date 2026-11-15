@@ -14,10 +14,18 @@ from .runtime_env import (
     is_colab,
     require_secret,
 )
-from .tunnel import TunnelProcess, parse_trycloudflare_url, start_cloudflared_tunnel
+from .tunnel import (
+    DEFAULT_TUNNEL_PROTOCOL,
+    SUPPORTED_TUNNEL_PROTOCOLS,
+    TunnelProcess,
+    parse_trycloudflare_url,
+    start_cloudflared_tunnel,
+)
 
 __all__ = [
     "DEFAULT_DRIVE_ROOT",
+    "DEFAULT_TUNNEL_PROTOCOL",
+    "SUPPORTED_TUNNEL_PROTOCOLS",
     "TunnelProcess",
     "download_hf_file",
     "download_hf_repo_files",

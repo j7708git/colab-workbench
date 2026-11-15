@@ -17,7 +17,12 @@ from typing import Iterable, Sequence
 
 from shared.hf_download import download_hf_file, download_hf_repo_files
 from shared.runtime_env import get_secret, get_secret_status
-from shared.tunnel import TunnelProcess, start_cloudflared_tunnel
+from shared.tunnel import (
+    DEFAULT_TUNNEL_PROTOCOL,
+    TunnelProcess,
+    normalize_tunnel_protocol,
+    start_cloudflared_tunnel,
+)
 
 DEFAULT_COMFY_DIR = Path("/content/ComfyUI")
 DEFAULT_SHM_ROOT = Path("/dev/shm")
@@ -520,6 +525,7 @@ def build_comfyui_command(
     port: int = 8188,
     extra_args: Sequence[str] | None = None,
     python_bin: str = sys.executable,
+    enable_compression: bool = True,
 ) -> list[str]:
     """Build the ComfyUI launch command forcing output and temp into RAM disk."""
     if port <= 0 or port > 65535:
@@ -532,6 +538,9 @@ def build_comfyui_command(
             arg == "--enable-cors-header" or arg.startswith("--enable-cors-header=")
             for arg in extra_args
         )
+    )
+    has_compress_arg = bool(
+        extra_args and "--enable-compress-response-body" in extra_args
     )
     cmd = [
         python_bin,
@@ -548,6 +557,8 @@ def build_comfyui_command(
     ]
     if not has_cors_arg:
         cmd.extend(["--enable-cors-header", "*"])
+    if enable_compression and not has_compress_arg:
+        cmd.append("--enable-compress-response-body")
     if extra_args:
         cmd.extend(extra_args)
     return cmd
@@ -668,6 +679,7 @@ class ZeroDiskLaunchResult:
     tunnel: TunnelProcess
     reaper_stop: threading.Event
     log_file: Path = DEFAULT_SHM_ROOT / "comfy-tmp" / "comfyui.log"
+    tunnel_log_file: Path = DEFAULT_SHM_ROOT / "comfy-tmp" / "cloudflared.log"
 
     def stop(self) -> None:
         """Stop the RAM disk reaper, Cloudflare tunnel, and ComfyUI server."""
@@ -691,10 +703,14 @@ def launch_comfyui_zero_disk(
     server_timeout_sec: float = 120.0,
     tunnel_timeout_sec: float = 30.0,
     cloudflared_bin: str | None = None,
+    tunnel_protocol: str | None = DEFAULT_TUNNEL_PROTOCOL,
+    enable_compression: bool = True,
 ) -> ZeroDiskLaunchResult:
     """Start ComfyUI in zero-disk mode, prune RAM outputs periodically, and expose via tunnel."""
+    normalized_protocol = normalize_tunnel_protocol(tunnel_protocol)
     dirs = prepare_zero_disk_dirs(shm_root)
     log_file = dirs["temp"] / "comfyui.log"
+    tunnel_log_file = dirs["temp"] / "cloudflared.log"
     cmd = build_comfyui_command(
         comfy_dir,
         shm_root=shm_root,
@@ -702,12 +718,13 @@ def launch_comfyui_zero_disk(
         port=port,
         extra_args=extra_args,
         python_bin=python_bin,
+        enable_compression=enable_compression,
     )
     reaper_stop, _ = start_ramdisk_reaper(
         (dirs["output"], dirs["temp"]),
         max_age_sec=max_age_sec,
         interval_sec=reaper_interval_sec,
-        exclude_names=("comfyui.log",),
+        exclude_names=("comfyui.log", "cloudflared.log"),
     )
     log_fp = None
     try:
@@ -736,6 +753,8 @@ def launch_comfyui_zero_disk(
             port,
             timeout_sec=tunnel_timeout_sec,
             cloudflared_bin=cloudflared_bin,
+            protocol=normalized_protocol,
+            log_file=tunnel_log_file,
         )
     except Exception:
         reaper_stop.set()
@@ -751,4 +770,5 @@ def launch_comfyui_zero_disk(
         tunnel=tunnel,
         reaper_stop=reaper_stop,
         log_file=log_file,
+        tunnel_log_file=tunnel_log_file,
     )

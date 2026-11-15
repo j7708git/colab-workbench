@@ -298,6 +298,7 @@ class ZeroDiskLaunchTests(unittest.TestCase):
             self.assertIn("--disable-auto-launch", cmd)
             cors_idx = cmd.index("--enable-cors-header")
             self.assertEqual(cmd[cors_idx + 1], "*")
+            self.assertIn("--enable-compress-response-body", cmd)
             self.assertEqual(cmd[-1], "--lowvram")
 
             cmd_explicit_sep = build_comfyui_command(
@@ -307,6 +308,7 @@ class ZeroDiskLaunchTests(unittest.TestCase):
             )
             self.assertEqual(cmd_explicit_sep.count("--enable-cors-header"), 1)
             self.assertNotIn("*", cmd_explicit_sep)
+            self.assertIn("--enable-compress-response-body", cmd_explicit_sep)
 
             cmd_explicit_eq = build_comfyui_command(
                 "/content/ComfyUI",
@@ -316,6 +318,20 @@ class ZeroDiskLaunchTests(unittest.TestCase):
             self.assertNotIn("--enable-cors-header", cmd_explicit_eq)
             self.assertIn("--enable-cors-header=https://example.com", cmd_explicit_eq)
             self.assertNotIn("*", cmd_explicit_eq)
+
+            cmd_explicit_compress = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                extra_args=["--enable-compress-response-body"],
+            )
+            self.assertEqual(cmd_explicit_compress.count("--enable-compress-response-body"), 1)
+
+            cmd_no_compress = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                enable_compression=False,
+            )
+            self.assertNotIn("--enable-compress-response-body", cmd_no_compress)
 
             with self.assertRaises(ValueError):
                 build_comfyui_command("/content/ComfyUI", shm_root=shm_root, port=0)
@@ -390,7 +406,7 @@ class ZeroDiskLaunchTests(unittest.TestCase):
 
                 self.assertEqual(
                     reaper_mock.call_args.kwargs.get("exclude_names"),
-                    ("comfyui.log",),
+                    ("comfyui.log", "cloudflared.log"),
                 )
 
                 self.assertEqual(result.public_url, "https://zero-disk-test.trycloudflare.com")
@@ -398,19 +414,28 @@ class ZeroDiskLaunchTests(unittest.TestCase):
                 self.assertEqual(result.output_dir, shm_root / "comfy-out")
                 self.assertEqual(result.temp_dir, shm_root / "comfy-tmp")
                 expected_log = shm_root / "comfy-tmp" / "comfyui.log"
+                expected_tunnel_log = shm_root / "comfy-tmp" / "cloudflared.log"
                 self.assertEqual(result.log_file, expected_log)
+                self.assertEqual(result.tunnel_log_file, expected_tunnel_log)
                 self.assertTrue(expected_log.is_file())
 
                 launched_cmd = popen_mock.call_args[0][0]
                 self.assertIn(str(shm_root / "comfy-out"), launched_cmd)
                 self.assertIn(str(shm_root / "comfy-tmp"), launched_cmd)
                 self.assertIn("--enable-cors-header", launched_cmd)
+                self.assertIn("--enable-compress-response-body", launched_cmd)
                 popen_kwargs = popen_mock.call_args.kwargs
                 log_fp = popen_kwargs["stdout"]
                 self.assertEqual(Path(log_fp.name), expected_log)
                 self.assertTrue(log_fp.closed)
                 self.assertEqual(popen_kwargs["stderr"], subprocess.STDOUT)
-                tunnel_mock.assert_called_once()
+                tunnel_mock.assert_called_once_with(
+                    8188,
+                    timeout_sec=30.0,
+                    cloudflared_bin=None,
+                    protocol="http2",
+                    log_file=expected_tunnel_log,
+                )
 
                 result.stop()
                 self.assertTrue(result.reaper_stop.is_set())
@@ -449,6 +474,22 @@ class ZeroDiskLaunchTests(unittest.TestCase):
             self.assertTrue(captured_fps[0].closed)
             self.assertTrue(reaper_stop.is_set())
 
+    def test_launch_comfyui_zero_disk_rejects_invalid_protocol_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch("comfyui.bootstrap.start_ramdisk_reaper") as reaper_mock,
+                mock.patch("comfyui.bootstrap.subprocess.Popen") as popen_mock,
+                self.assertRaises(ValueError),
+            ):
+                launch_comfyui_zero_disk(
+                    root / "ComfyUI",
+                    shm_root=root / "shm",
+                    tunnel_protocol="invalid",
+                )
+            reaper_mock.assert_not_called()
+            popen_mock.assert_not_called()
+
 
 class NotebookSmokeTests(unittest.TestCase):
     def test_notebook_step1_supports_branch_parameter(self) -> None:
@@ -475,9 +516,15 @@ class NotebookSmokeTests(unittest.TestCase):
         self.assertIn("429", step3_source)
 
         step4_source = "".join(cells["step-4-launch-zero-disk"].get("source", []))
+        self.assertIn('TUNNEL_PROTOCOL = "http2"  #@param ["http2", "auto", "quic"]', step4_source)
+        self.assertIn("tunnel_protocol=TUNNEL_PROTOCOL", step4_source)
         self.assertIn("ComfyUI Log:", step4_source)
+        self.assertIn("Tunnel Log:", step4_source)
+        self.assertIn("Tunnel Protocol:", step4_source)
         self.assertIn("session.log_file", step4_source)
+        self.assertIn("session.tunnel_log_file", step4_source)
         self.assertIn("--enable-cors-header *", step4_source)
+        self.assertIn("--enable-compress-response-body", step4_source)
         self.assertIn("403", step4_source)
 
         for cell_id in ("step-3-download-models", "step-4-launch-zero-disk"):

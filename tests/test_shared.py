@@ -640,6 +640,25 @@ class HfDownloadTests(unittest.TestCase):
 
 
 class TunnelTests(unittest.TestCase):
+    @staticmethod
+    def _write_fake_cloudflared(tmp_dir: Path, script_body: str, name: str = "cloudflared") -> Path:
+        py_script = Path(tmp_dir) / f"{name}.py"
+        py_script.write_text(script_body, encoding="utf-8")
+        if os.name == "nt":
+            fake_bin = Path(tmp_dir) / f"{name}.cmd"
+            fake_bin.write_text(
+                f'@echo off\r\n"{sys.executable}" -u "{py_script}" %*\r\n',
+                encoding="utf-8",
+            )
+            return fake_bin
+        fake_bin = Path(tmp_dir) / name
+        fake_bin.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" -u "{py_script}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake_bin.chmod(0o755)
+        return fake_bin
+
     def test_parse_trycloudflare_url(self) -> None:
         line = "2026-11-14T14:00:00Z INF |  https://bright-forest-123.trycloudflare.com  |"
         self.assertEqual(
@@ -649,39 +668,149 @@ class TunnelTests(unittest.TestCase):
         self.assertIsNone(parse_trycloudflare_url("nothing here"))
 
     def test_start_cloudflared_tunnel_parses_url_and_stops(self) -> None:
+        from shared import DEFAULT_TUNNEL_PROTOCOL, SUPPORTED_TUNNEL_PROTOCOLS
+
+        self.assertEqual(DEFAULT_TUNNEL_PROTOCOL, "http2")
+        self.assertEqual(SUPPORTED_TUNNEL_PROTOCOLS, ("auto", "http2", "quic"))
+
         with tempfile.TemporaryDirectory() as tmp:
-            if os.name == "nt":
-                fake_bin = Path(tmp) / "cloudflared.cmd"
-                fake_bin.write_text(
-                    "@echo off\r\n"
-                    f'"{sys.executable}" -u -c "import time; '
-                    "print('starting tunnel', flush=True); "
-                    "print('https://demo-unit-test.trycloudflare.com', flush=True); "
-                    'time.sleep(1)"\r\n',
-                    encoding="utf-8",
-                )
-            else:
-                fake_bin = Path(tmp) / "cloudflared"
-                fake_bin.write_text(
-                    "#!/usr/bin/env python3\n"
-                    "import sys, time\n"
-                    "print('starting tunnel', flush=True)\n"
-                    "print('https://demo-unit-test.trycloudflare.com', flush=True)\n"
-                    "time.sleep(10)\n",
-                    encoding="utf-8",
-                )
-                fake_bin.chmod(0o755)
+            tmp_path = Path(tmp)
+            argv_file = tmp_path / "argv.txt"
+            log_file = tmp_path / "logs" / "cloudflared.log"
+            fake_bin = self._write_fake_cloudflared(
+                tmp_path,
+                "import pathlib, sys, time\n"
+                f"pathlib.Path({str(argv_file)!r}).write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "print('starting tunnel', flush=True)\n"
+                "print('https://demo-unit-test.trycloudflare.com', flush=True)\n"
+                "time.sleep(0.5 if sys.platform == 'win32' else 10)\n",
+            )
 
             tunnel = start_cloudflared_tunnel(
                 8188,
                 timeout_sec=5.0,
                 cloudflared_bin=str(fake_bin),
+                log_file=log_file,
             )
             try:
                 self.assertEqual(tunnel.url, "https://demo-unit-test.trycloudflare.com")
                 self.assertEqual(tunnel.port, 8188)
+                self.assertEqual(tunnel.protocol, "http2")
+                self.assertEqual(tunnel.log_file, log_file)
+                self.assertIn("https://demo-unit-test.trycloudflare.com", tunnel.tail_logs())
             finally:
                 tunnel.stop()
+
+            argv = argv_file.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                argv,
+                ["tunnel", "--protocol", "http2", "--url", "http://127.0.0.1:8188", "--no-autoupdate"],
+            )
+            log_text = log_file.read_text(encoding="utf-8")
+            self.assertIn("starting tunnel", log_text)
+            self.assertIn("https://demo-unit-test.trycloudflare.com", log_text)
+
+    def test_start_cloudflared_tunnel_protocol_options_and_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            start_cloudflared_tunnel(8188, protocol="invalid-proto")
+        with self.assertRaises(ValueError):
+            start_cloudflared_tunnel(8188, protocol="  ")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            argv_file = tmp_path / "argv.txt"
+            fake_bin = self._write_fake_cloudflared(
+                tmp_path,
+                "import pathlib, sys\n"
+                f"pathlib.Path({str(argv_file)!r}).write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "print('https://proto-test.trycloudflare.com', flush=True)\n",
+            )
+
+            tunnel_quic = start_cloudflared_tunnel(
+                8188,
+                timeout_sec=5.0,
+                cloudflared_bin=str(fake_bin),
+                protocol=" QUIC ",
+            )
+            try:
+                self.assertEqual(tunnel_quic.protocol, "quic")
+            finally:
+                tunnel_quic.stop()
+            self.assertEqual(
+                argv_file.read_text(encoding="utf-8").splitlines(),
+                ["tunnel", "--protocol", "quic", "--url", "http://127.0.0.1:8188", "--no-autoupdate"],
+            )
+
+            tunnel_none = start_cloudflared_tunnel(
+                8188,
+                timeout_sec=5.0,
+                cloudflared_bin=str(fake_bin),
+                protocol=None,
+            )
+            try:
+                self.assertIsNone(tunnel_none.protocol)
+            finally:
+                tunnel_none.stop()
+            argv_none = argv_file.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                argv_none,
+                ["tunnel", "--url", "http://127.0.0.1:8188", "--no-autoupdate"],
+            )
+
+    def test_start_cloudflared_tunnel_drains_large_stdout_without_pipe_deadlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_file = tmp_path / "cloudflared.log"
+            fake_bin = self._write_fake_cloudflared(
+                tmp_path,
+                "import sys\n"
+                "print('https://pipe-drain-test.trycloudflare.com', flush=True)\n"
+                "payload = 'X' * 100\n"
+                "for idx in range(1600):\n"
+                "    sys.stdout.write(f'log-{idx:04d} {payload}\\n')\n"
+                "sys.stdout.write('SENTINEL_AFTER_LARGE_BURST\\n')\n"
+                "sys.stdout.flush()\n",
+            )
+
+            tunnel = start_cloudflared_tunnel(
+                8188,
+                timeout_sec=5.0,
+                cloudflared_bin=str(fake_bin),
+                log_file=log_file,
+            )
+            try:
+                self.assertEqual(tunnel.url, "https://pipe-drain-test.trycloudflare.com")
+                rc = tunnel.process.wait(timeout=10)
+                self.assertEqual(rc, 0)
+            finally:
+                tunnel.stop()
+
+            self.assertIn("SENTINEL_AFTER_LARGE_BURST", tunnel.tail_logs(lines=5))
+            self.assertLessEqual(len(tunnel.tail_logs(lines=200).splitlines()), 100)
+            self.assertGreater(log_file.stat().st_size, 128 * 1024)
+            self.assertIn("SENTINEL_AFTER_LARGE_BURST", log_file.read_text(encoding="utf-8"))
+
+    def test_start_cloudflared_tunnel_fails_fast_on_early_exit(self) -> None:
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_bin = self._write_fake_cloudflared(
+                tmp_path,
+                "import sys\n"
+                "print('ERR simulated startup failure', flush=True)\n"
+                "sys.exit(1)\n",
+            )
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError) as ctx:
+                start_cloudflared_tunnel(
+                    8188,
+                    timeout_sec=10.0,
+                    cloudflared_bin=str(fake_bin),
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5.0)
+            self.assertIn("ERR simulated startup failure", str(ctx.exception))
 
 
 if __name__ == "__main__":

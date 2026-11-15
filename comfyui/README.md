@@ -6,7 +6,7 @@
 
 - `comfyui.ipynb`：薄入口 Notebook（支援 `Open in Colab` 一鍵開啟；第 1 格提供 `BRANCH` 表單參數，預設對齊 `feat/comfyui-zero-disk-bootstrap`，若誤填尚未合併的 `main` 會自動 fallback 並清理 Python Namespace Package 快取，免重啟 Colab Runtime）
 - `install.sh`：初始化 `/dev/shm/comfy-out` 與 `/dev/shm/comfy-tmp`、安裝／更新 `/content/ComfyUI`（≥ v0.37.0）並執行 `pip install --upgrade huggingface_hub hf_xet pyyaml`（確保新版 `hf` CLI 與 429 修復就緒）
-- `bootstrap.py`：依 `repo_id` 批次呼叫 `hf download` 的模型下載器（含 `HF_TOKEN` 狀態檢查與 Xet 並發門檻）、RAM Disk 零磁碟指令組裝（預設帶入 `--enable-cors-header *`）、`/dev/shm/comfy-tmp/comfyui.log` 伺服器日誌、過期暫存定期清理（reaper）、`ensure_comfyui_package_ready()` 與 `cloudflared` 隧道整合
+- `bootstrap.py`：依 `repo_id` 批次呼叫 `hf download` 的模型下載器（含 `HF_TOKEN` 狀態檢查與 Xet 並發門檻）、RAM Disk 零磁碟指令組裝（預設帶入 `--enable-cors-header *` 與 `--enable-compress-response-body`）、`/dev/shm/comfy-tmp/comfyui.log` 與 `cloudflared.log` 記憶體內日誌、過期暫存定期清理（reaper）、`ensure_comfyui_package_ready()` 與 `cloudflared`（預設 HTTP/2＋背景 stdout 排空）隧道整合
 - `models.example.yaml`：預設與選配擴充模型清單範例（僅記錄 repo 與檔名，實際權重不進版控）
 
 ## Colab 匯入防呆機制（避免 `unknown location` 錯誤）
@@ -37,10 +37,10 @@
 ## 零磁碟輸出與前端連線（`dsh-simple-tavern`）
 
 1. `launch_comfyui_zero_disk()` 會強制帶入 `--output-directory /dev/shm/comfy-out --temp-directory /dev/shm/comfy-tmp --disable-auto-launch`，生圖過程與輸出圖檔僅駐留於 Linux `tmpfs` 記憶體，**不寫入 Colab 虛擬硬碟也不掛載 Google Drive**。
-2. **預設跨來源放行（修正 Colab 點擊 403）**：`build_comfyui_command()` 預設自動附加 `--enable-cors-header *`（若 `EXTRA_ARGS` 已自行傳入 `--enable-cors-header` 或 `--enable-cors-header=...` 則不會重複附加）。這能避免新版 ComfyUI 在未設 CORS 時啟用 `create_origin_only_middleware()`，導致從 Colab 輸出 iframe 直接點擊 `https://*.trycloudflare.com` 時因瀏覽器送出 `Sec-Fetch-Site: cross-site` 而回傳 HTTP 403。
-3. **記憶體內伺服器日誌**：`launch_comfyui_zero_disk()` 會將 ComfyUI 的 `stdout`/`stderr` 導向 `/dev/shm/comfy-tmp/comfyui.log`（紀錄於 `session.log_file`，仍完全零磁碟），並在啟動子行程後立即關閉父行程檔案描述符以避免 FD 洩漏。
-4. 背景執行 `start_ramdisk_reaper()`（預設每 60 秒清理超過 300 秒的暫存檔案，並自動略過執行中的 `comfyui.log`），避免長時間使用耗盡 Colab RAM。
-5. 啟動完成後會印出 `https://*.trycloudflare.com` 網址，可直接從 Colab 點擊開啟或貼入 `dsh-simple-tavern` 設定頁的 `ComfyUI URL`（相容既有 `/prompt`、`/history` 與 `/view` API，前端無須修改程式碼）。
+2. **預設跨來源放行與回應壓縮（修正 403 與 Tunnel 大型 JSON 傳輸）**：`build_comfyui_command()` 預設自動附加 `--enable-cors-header *`（若 `EXTRA_ARGS` 已傳入 `--enable-cors-header` 或 `--enable-cors-header=...` 則不重複附加）與 `--enable-compress-response-body`（可用 `enable_compression=False` 停用；僅壓縮 JSON／純文字回應，如約 2 MB 以上的 `/object_info`，不影響圖片位元組）。這可避免瀏覽器跨站 403，同時大幅縮減透過 Cloudflare Tunnel 傳送節點資訊與歷史紀錄的體積。
+3. **記憶體內伺服器／隧道日誌與背景排空**：`launch_comfyui_zero_disk()` 會將 ComfyUI 輸出導向 `/dev/shm/comfy-tmp/comfyui.log`（紀錄於 `session.log_file`），並由背景執行緒持續排空 `cloudflared` 的 stdout／stderr 寫入 `/dev/shm/comfy-tmp/cloudflared.log`（紀錄於 `session.tunnel_log_file`，可透過 `session.tunnel.tail_logs()` 查看近期輸出），避免長時間運行時因 pipe buffer 塞滿而導致 `cloudflared` 卡死。
+4. 背景執行 `start_ramdisk_reaper()`（預設每 60 秒清理超過 300 秒的暫存檔案，並自動略過執行中的 `comfyui.log` 與 `cloudflared.log`），避免長時間使用耗盡 Colab RAM。
+5. **預設 HTTP/2 隧道協議**：第 4 格提供 `TUNNEL_PROTOCOL`（預設 `"http2"`，可選 `"auto"` 或 `"quic"`），避免 Colab 環境下 UDP/QUIC 遭限流或抖動。啟動完成後會印出 `https://*.trycloudflare.com` 網址，可直接從 Colab 點擊開啟或貼入 `dsh-simple-tavern` 設定頁的 `ComfyUI URL`（相容既有 `/prompt`、`/history` 與 `/view` API，前端無須修改程式碼）。
 
 ## 資源與顯存注意事項
 
