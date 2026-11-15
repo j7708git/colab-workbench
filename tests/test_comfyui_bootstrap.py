@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ from comfyui import (
     build_comfyui_command,
     cleanup_expired_files,
     download_preset_models,
+    ensure_comfyui_package_ready,
     launch_comfyui_zero_disk,
     load_models_from_yaml,
     prepare_zero_disk_dirs,
@@ -208,11 +210,83 @@ class NotebookSmokeTests(unittest.TestCase):
         notebook = json.loads(nb_path.read_text(encoding="utf-8"))
         cells = {cell.get("id"): cell for cell in notebook.get("cells", [])}
         self.assertIn("step-1-bootstrap-repo", cells)
+        self.assertIn("step-3-download-models", cells)
+        self.assertIn("step-4-launch-zero-disk", cells)
 
-        source_text = "".join(cells["step-1-bootstrap-repo"].get("source", []))
-        self.assertIn('BRANCH = "main"  #@param {type:"string"}', source_text)
-        self.assertIn("--branch {BRANCH}", source_text)
-        self.assertIn("fetch origin {BRANCH}", source_text)
+        step1_source = "".join(cells["step-1-bootstrap-repo"].get("source", []))
+        self.assertIn('BRANCH = "feat/comfyui-zero-disk-bootstrap"  #@param {type:"string"}', step1_source)
+        self.assertIn("+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}", step1_source)
+        self.assertIn('"checkout", "-B", BRANCH, f"origin/{BRANCH}"', step1_source)
+        self.assertIn("importlib.invalidate_caches()", step1_source)
+        self.assertIn("sys.modules", step1_source)
+        self.assertIn("comfyui/__init__.py", step1_source)
+
+        for cell_id in ("step-3-download-models", "step-4-launch-zero-disk"):
+            cell_source = "".join(cells[cell_id].get("source", []))
+            self.assertIn("importlib.invalidate_caches()", cell_source)
+            self.assertIn("sys.modules", cell_source)
+
+    def test_namespace_package_cache_recovery(self) -> None:
+        real_repo_dir = Path(__file__).resolve().parents[1]
+        real_repo_resolved = real_repo_dir.resolve()
+        original_sys_path = list(sys.path)
+        original_modules = {
+            k: v
+            for k, v in sys.modules.items()
+            if k == "comfyui" or k.startswith("comfyui.")
+        }
+
+        def _is_real_repo(entry: str) -> bool:
+            try:
+                return Path(entry or ".").resolve() == real_repo_resolved
+            except OSError:
+                return False
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_repo = Path(tmp) / "fake_repo"
+                (fake_repo / "comfyui").mkdir(parents=True)
+
+                for mod_name in [
+                    k for k in list(sys.modules) if k == "comfyui" or k.startswith("comfyui.")
+                ]:
+                    del sys.modules[mod_name]
+
+                sys.path[:] = [
+                    str(fake_repo),
+                    *[p for p in original_sys_path if not _is_real_repo(p)],
+                ]
+                importlib.invalidate_caches()
+
+                import comfyui as stale_pkg
+
+                self.assertIsNone(getattr(stale_pkg, "__file__", None))
+                with self.assertRaises(ImportError):
+                    from comfyui import download_preset_models as _missing  # noqa: F401
+
+                init_path = ensure_comfyui_package_ready(real_repo_dir)
+                self.assertEqual(init_path, (real_repo_dir / "comfyui" / "__init__.py").resolve())
+
+                import comfyui as recovered_pkg
+                from comfyui import (
+                    download_preset_models as recovered_download,
+                    load_models_from_yaml as recovered_loader,
+                )
+
+                self.assertEqual(
+                    Path(recovered_pkg.__file__).resolve(),
+                    (real_repo_dir / "comfyui" / "__init__.py").resolve(),
+                )
+                self.assertTrue(callable(recovered_download))
+                self.assertTrue(callable(recovered_loader))
+        finally:
+            sys.path[:] = original_sys_path
+            for mod_name in [
+                k for k in list(sys.modules) if k == "comfyui" or k.startswith("comfyui.")
+            ]:
+                del sys.modules[mod_name]
+            sys.modules.update(original_modules)
+            importlib.invalidate_caches()
 
 
 if __name__ == "__main__":

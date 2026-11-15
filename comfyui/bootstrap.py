@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import shutil
 import subprocess
@@ -20,6 +21,38 @@ from shared.tunnel import TunnelProcess, start_cloudflared_tunnel
 
 DEFAULT_COMFY_DIR = Path("/content/ComfyUI")
 DEFAULT_SHM_ROOT = Path("/dev/shm")
+
+
+def ensure_comfyui_package_ready(
+    repo_dir: str | Path = "/content/colab-workbench",
+) -> Path:
+    """Ensure ``repo_dir`` is first on ``sys.path`` and clear stale namespace caches."""
+    repo_path = Path(repo_dir)
+    init_file = repo_path / "comfyui" / "__init__.py"
+    if not init_file.is_file():
+        raise FileNotFoundError(
+            f"Missing {init_file}; ensure the repository is checked out on a branch containing the comfyui package."
+        )
+
+    repo_str = str(repo_path)
+    sys.path[:] = [repo_str, *[p for p in sys.path if p != repo_str]]
+    importlib.invalidate_caches()
+
+    resolved_init = init_file.resolve()
+    cached = sys.modules.get("comfyui")
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        needs_reset = (
+            not isinstance(cached_file, (str, os.PathLike))
+            or not hasattr(cached, "download_preset_models")
+            or Path(cached_file).resolve() != resolved_init
+        )
+        if needs_reset:
+            for mod_name in list(sys.modules):
+                if mod_name == "comfyui" or mod_name.startswith("comfyui."):
+                    del sys.modules[mod_name]
+
+    return resolved_init
 
 
 @dataclass(frozen=True)
