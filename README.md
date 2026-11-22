@@ -7,7 +7,7 @@
 | 目錄 | 用途 | 狀態 |
 | --- | --- | --- |
 | [`shared/`](./shared/) | 跨專區共用模組（Secrets 讀取、Drive 掛載與軟連結、HF 下載、內網穿透） | 已建立 |
-| [`comfyui/`](./comfyui/) | ComfyUI 零磁碟 Colab 部署與預設模型下載器 | 已建立 |
+| [`comfyui/`](./comfyui/) | ComfyUI 零磁碟 Colab 部署、預設模型下載器與 MiniMax H3 Ref2VA 參考人像生影片環境 | 已建立 |
 | [`llm-inference/`](./llm-inference/) | 開源大語言模型推理（如 `llama.cpp` / `vLLM` / WebUI） | 骨架就緒 |
 | [`lora-training/`](./lora-training/) | Fizgig MOSS-Image 人物 LoRA 訓練與 Web UI 工作台（預留 LLM QLoRA） | 已建立 |
 | [`docs/`](./docs/) | 公開使用指南（[Colab Secrets 與 Google Drive 持久化](./docs/secrets-and-drive.md)） | 已建立 |

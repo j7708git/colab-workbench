@@ -16,11 +16,13 @@ from pathlib import Path
 from unittest import mock
 
 from comfyui import (
+    MINIMAX_H3_REF2VA_8STEP_MODELS,
     ModelEntry,
     build_comfyui_command,
     cleanup_expired_files,
     download_preset_models,
     ensure_comfyui_package_ready,
+    install_bundled_workflows,
     launch_comfyui_zero_disk,
     load_models_from_yaml,
     prepare_zero_disk_dirs,
@@ -55,6 +57,46 @@ class ModelPresetTests(unittest.TestCase):
         entries = load_models_from_yaml(yaml_path)
         self.assertEqual(len(entries), 7)
         self.assertEqual(entries[0].dest_rel_path(), Path("diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors"))
+
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            fallback_entries = load_models_from_yaml(yaml_path)
+        self.assertEqual(fallback_entries, entries)
+
+    def test_resolve_minimax_h3_presets_and_no_lora_cross_mixing(self) -> None:
+        ref2va_8 = resolve_model_preset("minimax_h3_ref2va_8step")
+        ref2va_fp8 = resolve_model_preset("minimax_h3_ref2va_8step_fp8")
+        ref2va_full = resolve_model_preset("minimax_h3_ref2va_full")
+        fl2va_8 = resolve_model_preset("minimax_h3_fl2va_8step")
+
+        self.assertEqual(len(ref2va_8), 5)
+        self.assertEqual(len(ref2va_fp8), 5)
+        self.assertEqual(len(ref2va_full), 6)
+        self.assertEqual(len(fl2va_8), 5)
+
+        for entries in (ref2va_8, ref2va_fp8, ref2va_full):
+            names_and_files = " ".join(e.filename for e in entries)
+            self.assertIn("ref2va", names_and_files)
+            self.assertIn("minimax_h3_ref2v_turbo_8step", names_and_files)
+            self.assertNotIn("fl2va", names_and_files)
+            self.assertNotIn("fl2v", names_and_files)
+
+        fl2v_files = " ".join(e.filename for e in fl2va_8)
+        self.assertIn("fl2va", fl2v_files)
+        self.assertIn("minimax_h3_fl2v_turbo_8step", fl2v_files)
+        self.assertNotIn("ref2va", fl2v_files)
+        self.assertNotIn("ref2v", fl2v_files)
+
+        lora_8_ref = ref2va_8[-1]
+        self.assertEqual(lora_8_ref.repo_id, "lightx2v/Minimax-h3-Turbo")
+        self.assertEqual(
+            lora_8_ref.dest_rel_path(),
+            Path("loras/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"),
+        )
+
+    def test_load_models_from_minimax_h3_example_yaml(self) -> None:
+        yaml_path = Path(__file__).resolve().parents[1] / "comfyui" / "models.minimax_h3.example.yaml"
+        entries = load_models_from_yaml(yaml_path)
+        self.assertEqual(entries, list(MINIMAX_H3_REF2VA_8STEP_MODELS))
 
         with mock.patch.dict(sys.modules, {"yaml": None}):
             fallback_entries = load_models_from_yaml(yaml_path)
@@ -275,6 +317,65 @@ class ModelDownloadTests(unittest.TestCase):
             self.assertTrue((comfy_dir / "models" / "loras" / "good.safetensors").is_file())
             self.assertFalse((comfy_dir / "models" / "loras" / "bad.safetensors").exists())
 
+    def test_download_preset_models_minimax_h3_batches_base_and_relocates_turbo_lora(self) -> None:
+        batch_calls: list[tuple[str, list[str]]] = []
+        file_calls: list[tuple[str, str, str]] = []
+
+        def fake_repo_download(repo_id: str, filenames, *, local_dir, token=None, **kwargs):
+            file_list = list(filenames)
+            batch_calls.append((repo_id, file_list))
+            paths: list[Path] = []
+            for fname in file_list:
+                out_path = Path(local_dir) / fname
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(b"weights")
+                paths.append(out_path)
+            return paths
+
+        def fake_file_download(repo_id: str, filename: str, *, local_dir, token=None, **kwargs):
+            file_calls.append((repo_id, filename, str(local_dir)))
+            out_path = Path(local_dir) / filename
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"lora-weights")
+            return out_path
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("comfyui.bootstrap.download_hf_repo_files", side_effect=fake_repo_download),
+            mock.patch("comfyui.bootstrap.download_hf_file", side_effect=fake_file_download),
+            mock.patch("comfyui.bootstrap.get_secret_status", return_value=(True, "env")),
+        ):
+            comfy_dir = Path(tmp) / "ComfyUI"
+            got = download_preset_models(
+                comfy_dir,
+                preset="minimax_h3_ref2va_8step",
+                token="placeholder-token",
+                pause_sec=0.0,
+            )
+
+            self.assertEqual(len(got), 5)
+            self.assertEqual(len(batch_calls), 1)
+            self.assertEqual(batch_calls[0][0], "Comfy-Org/MiniMax-H3")
+            self.assertEqual(len(batch_calls[0][1]), 4)
+            self.assertEqual(
+                file_calls,
+                [
+                    (
+                        "lightx2v/Minimax-h3-Turbo",
+                        "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+                        str(comfy_dir / "models" / ".hf-staging"),
+                    )
+                ],
+            )
+            self.assertTrue(
+                (
+                    comfy_dir
+                    / "models"
+                    / "loras"
+                    / "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+                ).is_file()
+            )
+
 
 class ZeroDiskLaunchTests(unittest.TestCase):
     def test_prepare_zero_disk_dirs_and_build_command(self) -> None:
@@ -335,6 +436,59 @@ class ZeroDiskLaunchTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 build_comfyui_command("/content/ComfyUI", shm_root=shm_root, port=0)
+
+            cmd_reserve = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                reserve_vram_gb=2.0,
+            )
+            rv_idx = cmd_reserve.index("--reserve-vram")
+            self.assertEqual(cmd_reserve[rv_idx + 1], "2")
+
+            cmd_reserve_zero = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                reserve_vram_gb=0.0,
+            )
+            self.assertNotIn("--reserve-vram", cmd_reserve_zero)
+
+            cmd_reserve_dedup = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                reserve_vram_gb=2.0,
+                extra_args=["--reserve-vram", "3.0"],
+            )
+            self.assertEqual(cmd_reserve_dedup.count("--reserve-vram"), 1)
+            self.assertEqual(cmd_reserve_dedup[cmd_reserve_dedup.index("--reserve-vram") + 1], "3.0")
+
+            cmd_reserve_eq = build_comfyui_command(
+                "/content/ComfyUI",
+                shm_root=shm_root,
+                reserve_vram_gb=2.0,
+                extra_args=["--reserve-vram=3.0"],
+            )
+            self.assertNotIn("--reserve-vram", cmd_reserve_eq)
+            self.assertIn("--reserve-vram=3.0", cmd_reserve_eq)
+
+            with self.assertRaises(ValueError):
+                build_comfyui_command("/content/ComfyUI", shm_root=shm_root, reserve_vram_gb=-0.5)
+
+    def test_install_bundled_workflows_copies_and_respects_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            comfy_dir = Path(tmp) / "ComfyUI"
+            installed = install_bundled_workflows(comfy_dir)
+            dest = comfy_dir / "user" / "default" / "workflows" / "minimax_h3_ref2va_8step_kj.json"
+            self.assertIn(dest, installed)
+            self.assertTrue(dest.is_file())
+
+            dest.write_text('{"custom": true}', encoding="utf-8")
+            skipped = install_bundled_workflows(comfy_dir, overwrite=False)
+            self.assertIn(dest, skipped)
+            self.assertEqual(dest.read_text(encoding="utf-8"), '{"custom": true}')
+
+            overwritten = install_bundled_workflows(comfy_dir, overwrite=True)
+            self.assertIn(dest, overwritten)
+            self.assertNotEqual(dest.read_text(encoding="utf-8"), '{"custom": true}')
 
     def test_cleanup_expired_files_removes_only_expired(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,6 +556,7 @@ class ZeroDiskLaunchTests(unittest.TestCase):
                     shm_root=shm_root,
                     port=8188,
                     reaper_interval_sec=60.0,
+                    reserve_vram_gb=2.0,
                 )
 
                 self.assertEqual(
@@ -424,6 +579,8 @@ class ZeroDiskLaunchTests(unittest.TestCase):
                 self.assertIn(str(shm_root / "comfy-tmp"), launched_cmd)
                 self.assertIn("--enable-cors-header", launched_cmd)
                 self.assertIn("--enable-compress-response-body", launched_cmd)
+                self.assertIn("--reserve-vram", launched_cmd)
+                self.assertEqual(launched_cmd[launched_cmd.index("--reserve-vram") + 1], "2")
                 popen_kwargs = popen_mock.call_args.kwargs
                 log_fp = popen_kwargs["stdout"]
                 self.assertEqual(Path(log_fp.name), expected_log)
@@ -594,6 +751,108 @@ class NotebookSmokeTests(unittest.TestCase):
                 del sys.modules[mod_name]
             sys.modules.update(original_modules)
             importlib.invalidate_caches()
+
+    def test_install_sh_uses_lf_and_supports_kjnodes_cu130_and_workflows(self) -> None:
+        install_path = Path(__file__).resolve().parents[1] / "comfyui" / "install.sh"
+        raw = install_path.read_bytes()
+        self.assertNotIn(b"\r\n", raw)
+        text = raw.decode("utf-8")
+        for needle in (
+            "INSTALL_KJNODES",
+            "UPGRADE_TORCH_CU130",
+            "INSTALL_WORKFLOWS",
+            "ComfyUI-KJNodes",
+            "ffmpeg",
+        ):
+            self.assertIn(needle, text)
+
+    def test_minimax_h3_workflow_graph_integrity_and_models(self) -> None:
+        wf_path = (
+            Path(__file__).resolve().parents[1]
+            / "comfyui"
+            / "workflows"
+            / "minimax_h3_ref2va_8step_kj.json"
+        )
+        wf = json.loads(wf_path.read_text(encoding="utf-8"))
+        nodes = {n["id"]: n for n in wf["nodes"]}
+
+        # Validate every link resolves cleanly to matching node slots and types
+        seen_links: set[int] = set()
+        for link in wf["links"]:
+            link_id, src_id, src_slot, dst_id, dst_slot, link_type = link
+            self.assertNotIn(link_id, seen_links)
+            seen_links.add(link_id)
+            src_node = nodes[src_id]
+            dst_node = nodes[dst_id]
+            src_out = src_node["outputs"][src_slot]
+            dst_in = dst_node["inputs"][dst_slot]
+            self.assertEqual(dst_in["link"], link_id)
+            self.assertIn(link_id, src_out["links"])
+            self.assertEqual(src_out["type"], link_type)
+            self.assertIn(link_type, str(dst_in["type"]).split(","))
+
+        # Verify model patch chain: UNETLoader -> LoraLoaderModelOnly -> Switch -> SigmaShift -> LowVRAM -> ChunkFF -> BasicScheduler & BasicGuider
+        self.assertEqual(nodes[147]["type"], "MiniMaxH3SigmaShift")
+        self.assertEqual(nodes[147]["widgets_values"], [12.0, 3.0])
+        self.assertEqual(nodes[148]["type"], "MiniMaxLowVRAMAttention")
+        self.assertEqual(nodes[148]["widgets_values"], [16])
+        self.assertEqual(nodes[149]["type"], "MiniMaxChunkFeedForward")
+        self.assertEqual(nodes[149]["widgets_values"], [8, 4096])
+
+        link_by_id = {lk[0]: lk for lk in wf["links"]}
+        self.assertEqual(link_by_id[nodes[145]["inputs"][0]["link"]][1], 127)
+        self.assertEqual(link_by_id[nodes[141]["inputs"][0]["link"]][1], 127)
+        self.assertEqual(link_by_id[nodes[141]["inputs"][1]["link"]][1], 145)
+        self.assertEqual(link_by_id[nodes[147]["inputs"][0]["link"]][1], 141)
+        self.assertEqual(link_by_id[nodes[148]["inputs"][0]["link"]][1], 147)
+        self.assertEqual(link_by_id[nodes[149]["inputs"][0]["link"]][1], 148)
+        self.assertEqual(link_by_id[nodes[124]["inputs"][0]["link"]][1], 149)
+        self.assertEqual(link_by_id[nodes[126]["inputs"][0]["link"]][1], 149)
+
+        # Verify all 5 model filenames match MINIMAX_H3_REF2VA_8STEP_MODELS
+        wf_model_names = {
+            nodes[127]["widgets_values"][0],
+            nodes[128]["widgets_values"][0],
+            nodes[119]["widgets_values"][0],
+            nodes[120]["widgets_values"][0],
+            nodes[145]["widgets_values"][0],
+        }
+        preset_model_names = {Path(e.filename).name for e in MINIMAX_H3_REF2VA_8STEP_MODELS}
+        self.assertEqual(wf_model_names, preset_model_names)
+
+    def test_minimax_h3_notebook_structure(self) -> None:
+        nb_path = Path(__file__).resolve().parents[1] / "comfyui" / "minimax_h3.ipynb"
+        notebook = json.loads(nb_path.read_text(encoding="utf-8"))
+        cells = {cell.get("id"): cell for cell in notebook.get("cells", [])}
+        for cid in (
+            "minimax-h3-header",
+            "step-1-bootstrap-repo",
+            "step-2-install-minimax-h3-env",
+            "step-3-download-models",
+            "step-4-launch-comfyui",
+            "step-5-utils-and-stop",
+        ):
+            self.assertIn(cid, cells)
+
+        step1 = "".join(cells["step-1-bootstrap-repo"]["source"])
+        self.assertIn('BRANCH = "main"  #@param {type:"string"}', step1)
+        self.assertIn("importlib.invalidate_caches()", step1)
+        self.assertIn("sys.modules", step1)
+        self.assertIn("minimax_h3_ref2va_8step_kj.json", step1)
+
+        step2 = "".join(cells["step-2-install-minimax-h3-env"]["source"])
+        self.assertIn("INSTALL_KJNODES", step2)
+        self.assertIn("UPGRADE_TORCH_CU130", step2)
+
+        step3 = "".join(cells["step-3-download-models"]["source"])
+        self.assertIn('PRESET = "minimax_h3_ref2va_8step"', step3)
+        self.assertIn("install_bundled_workflows()", step3)
+
+        step4 = "".join(cells["step-4-launch-comfyui"]["source"])
+        self.assertIn("RESERVE_VRAM_GB = 2.0", step4)
+        self.assertIn("MAX_AGE_SEC = 1800", step4)
+        self.assertIn('TUNNEL_PROTOCOL = "http2"', step4)
+        self.assertIn("reserve_vram_gb=", step4)
 
 
 if __name__ == "__main__":
