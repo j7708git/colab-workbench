@@ -4,10 +4,13 @@
 
 ## 檔案說明
 
-- `comfyui.ipynb`：薄入口 Notebook（支援 `Open in Colab` 一鍵開啟；第 1 格提供 `BRANCH` 表單參數，預設為 `main`，若輸入尚未包含 `comfyui/__init__.py` 的測試分支會自動 fallback 回 `main` 並清理 Python Namespace Package 快取，免重啟 Colab Runtime）
-- `install.sh`：初始化 `/dev/shm/comfy-out` 與 `/dev/shm/comfy-tmp`、安裝／更新 `/content/ComfyUI`（≥ v0.37.0）並執行 `pip install --upgrade huggingface_hub hf_xet pyyaml`（確保新版 `hf` CLI 與 429 修復就緒）
-- `bootstrap.py`：依 `repo_id` 批次呼叫 `hf download` 的模型下載器（含 `HF_TOKEN` 狀態檢查與 Xet 並發門檻）、RAM Disk 零磁碟指令組裝（預設帶入 `--enable-cors-header *` 與 `--enable-compress-response-body`）、`/dev/shm/comfy-tmp/comfyui.log` 與 `cloudflared.log` 記憶體內日誌、過期暫存定期清理（reaper）、`ensure_comfyui_package_ready()` 與 `cloudflared`（預設 HTTP/2＋背景 stdout 排空）隧道整合
-- `models.example.yaml`：預設與選配擴充模型清單範例（僅記錄 repo 與檔名，實際權重不進版控）
+- `comfyui.ipynb`：通用生圖薄入口 Notebook（支援 `Open in Colab` 一鍵開啟；第 1 格提供 `BRANCH` 表單參數，預設為 `main`，若輸入尚未包含 `comfyui/__init__.py` 的測試分支會自動 fallback 回 `main` 並清理 Python Namespace Package 快取，免重啟 Colab Runtime）
+- `minimax_h3.ipynb`：專為 **MiniMax H3 參考人像生影片（Ref2VA）** 設計的 5-Cell Colab 啟動器（自動啟用 `ComfyUI-KJNodes` 無損分塊、預載 `minimax_h3_ref2va_8step_kj.json`、預設 `--reserve-vram 2.0` 與 30 分鐘 RAM Disk 輸出保留）
+- `install.sh`：初始化 `/dev/shm/comfy-out` 與 `/dev/shm/comfy-tmp`、安裝／更新 `/content/ComfyUI`（≥ v0.38.0）並執行 `pip install --upgrade huggingface_hub hf_xet pyyaml`（確保新版 `hf` CLI 與 429 修復就緒）；支援 `INSTALL_KJNODES=1`（安裝 `ComfyUI-KJNodes`）、`UPGRADE_TORCH_CU130=1`（升級 PyTorch `cu130`）、`INSTALL_WORKFLOWS=1`（預設同步 `comfyui/workflows/*.json` 至 `ComfyUI/user/default/workflows/`）與自動安裝 `ffmpeg`
+- `bootstrap.py`：依 `repo_id` 批次呼叫 `hf download` 的模型下載器（含 `HF_TOKEN` 狀態檢查與 Xet 並發門檻）、`install_bundled_workflows()`、RAM Disk 零磁碟指令組裝（預設帶入 `--enable-cors-header *` 與 `--enable-compress-response-body`，並支援 `reserve_vram_gb` → `--reserve-vram`）、`/dev/shm/comfy-tmp/comfyui.log` 與 `cloudflared.log` 記憶體內日誌、過期暫存定期清理（reaper）、`ensure_comfyui_package_ready()` 與 `cloudflared`（預設 HTTP/2＋背景 stdout 排空）隧道整合
+- `models.example.yaml`：圖片生圖預設與選配擴充模型清單範例（僅記錄 repo 與檔名，實際權重不進版控）
+- `models.minimax_h3.example.yaml`：MiniMax H3 Ref2VA 模型下載清單範例（預設 8 步 Turbo + 可選 4 步／FP8／FL2VA／風格 Embedding）
+- `workflows/minimax_h3_ref2va_8step_kj.json`：預載 MiniMax H3 Ref2VA 8 步 Turbo + `ModelSamplingMiniMaxH3 (12, 3)` + KJNodes 無損分塊（`head_chunks=16`、`ffn_chunks=8`）工作流 JSON
 
 ## Colab 匯入防呆機制（避免 `unknown location` 錯誤）
 
@@ -26,6 +29,10 @@
 | `qwen21_turbo_int8` | 主模型 `qwen_image_2.1_turbo_int8_convrot.safetensors`、Text Encoder `qwen3vl_8b_int8_convrot.safetensors`、VAE `qwen_image_2.1_vae_bf16.safetensors` | `Comfy-Org/Qwen-Image-2.1` |
 | `moss_sft_int8` | 主模型 `moss_image_sft_int8_convrot.safetensors`、Text Encoder `qwen3.5_9b_int8_convrot.safetensors`、VAE `flux2-vae.safetensors`、4 步蒸餾 LoRA `moss_image_sft_4_steps_lora_v2_600_avg_rank_72_bf16.safetensors` | `Comfy-Org/MOSS-Image`、`Kijai/MOSS-image_experimental` |
 | `both`（預設） | 同時下載上述兩組全部 7 個檔案（合計約 33.5 GB） | 同上 |
+| `minimax_h3_ref2va_8step` | Ref2VA 主模型 `minimax_h3_ref2va_pruned_int8_convrot.safetensors`、Text Encoder `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`、Video VAE `fp16`、Audio VAE `fp32`、8 步 Ref2V Turbo LoRA `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors`（5 檔合計約 41.4 GB） | `Comfy-Org/MiniMax-H3`、`lightx2v/Minimax-h3-Turbo` |
+| `minimax_h3_ref2va_8step_fp8` | 同上，主模型改為 `minimax_h3_ref2va_pruned_fp8_scaled.safetensors` 備援版（5 檔合計約 41.4 GB） | 同上 |
+| `minimax_h3_ref2va_full` | `minimax_h3_ref2va_8step` 另加 4 步草圖 LoRA `minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors`（6 檔合計約 43.2 GB） | 同上 |
+| `minimax_h3_fl2va_8step` | 首尾幀主模型 `minimax_h3_fl2va_pruned_int8_convrot.safetensors`＋共用編碼器／VAE＋8 步 FL2V LoRA `minimax_h3_fl2v_turbo_8step_v1.2_768p_comfyui_bf16.safetensors`（5 檔合計約 41.5 GB） | 同上 |
 
 ## 模型下載、HF_TOKEN 與 HTTP 429 防護機制
 
@@ -45,3 +52,10 @@
 ## 資源與顯存注意事項
 
 - `qwen21_turbo_int8` 與 `moss_sft_int8` 皆為中大型模型（合計約 33.5 GB 磁碟暫存，推理建議 Colab L4 24GB 或 A100 40GB 以上執行階段）；若僅在 T4 等較小資源測試，可在第 3 格將 `PRESET` 改選單一模型套件並在 `EXTRA_ARGS` 視需要加入 `--lowvram`。
+
+## MiniMax H3 參考人像生影片實戰注意事項
+
+- **Colab 執行階段建議**：`minimax_h3.ipynb` 強烈建議使用 **L4（24GB）** 或 **A100（40GB / 80GB）並開啟 High-RAM**；請避免使用 T4（16GB VRAM 與標準系統記憶體難以承載約 41.4 GB 權重與長序列計算）。若遇到 `int8_convrot` 在部分驅動環境推論偏慢，可改選 `minimax_h3_ref2va_8step_fp8` preset 或在安裝格勾選 `UPGRADE_TORCH_CU130`。
+- **嚴禁交叉混用 LoRA**：Ref2VA（參考人像生成新鏡頭）務必使用 `minimax_h3_ref2va_*` 主模型配 `minimax_h3_ref2v_turbo_*` LoRA；FL2VA（首尾幀圖生影）則配 `minimax_h3_fl2v_turbo_*` LoRA，切勿混用。預設推薦 **8 步 Turbo LoRA** 以守住臉部紋理與細節。
+- **無損防溢流與影片保留**：`minimax_h3_ref2va_8step_kj.json` 內建 `ModelSamplingMiniMaxH3 (12.0, 3.0)` → `MiniMaxLowVRAMAttention (head_chunks=16)` → `MiniMaxChunkFeedForward (chunks=8)`，同時啟動時預設帶入 `--reserve-vram 2.0` 與 `MAX_AGE_SEC=1800`（RAM Disk 保留 30 分鐘），生成完成後請於瀏覽器及時下載 MP4。
+- **防變臉與提示詞規範**：近景大臉特寫約在 2.9 秒後較易發生身分漂移，建議特寫鏡頭控制在 3 秒以內或改用中景＋頭部比例空間約束；提示詞請使用英文三段式結構（`integrated_multimodal_description:`、`overall_soundscape:`、`non_diegetic_music:`），口播台詞包在 `<d>[Chinese] ...</d>` 中。

@@ -1,0 +1,65 @@
+# MiniMax H3 模型下載清單範例（配合 comfyui.bootstrap.load_models_from_yaml 或 PRESET 使用，勿將實際權重 commit 進倉庫）
+# 預設核心組合 minimax_h3_ref2va_8step（共 5 檔，約 41.4 GB）：
+#   - Ref2VA 主模型：minimax_h3_ref2va_pruned_int8_convrot.safetensors（~19.53 GiB）
+#   - 多模態文字編碼器：qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors（~14.61 GiB）
+#   - Video VAE + Audio VAE：fp16（~4.85 GiB）+ fp32（~0.56 GiB）
+#   - 8 步 Ref2V Turbo LoRA：minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors（~1.82 GiB）
+
+models:
+  minimax_h3_ref2va_8step:
+    - name: minimax-h3-ref2va-pruned-int8-convrot
+      repo_id: Comfy-Org/MiniMax-H3
+      filename: diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+      target_subdir: diffusion_models
+
+    - name: qwen3vl-32b-minimax-h3-nvfp4-awq
+      repo_id: Comfy-Org/MiniMax-H3
+      filename: text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+      target_subdir: text_encoders
+
+    - name: minimax-h3-video-vae-fp16
+      repo_id: Comfy-Org/MiniMax-H3
+      filename: vae/minimax_h3_video_vae_fp16.safetensors
+      target_subdir: vae
+
+    - name: minimax-h3-audio-vae-fp32
+      repo_id: Comfy-Org/MiniMax-H3
+      filename: vae/minimax_h3_audio_vae_fp32.safetensors
+      target_subdir: vae
+
+    - name: minimax-h3-ref2v-turbo-8step-lora
+      repo_id: lightx2v/Minimax-h3-Turbo
+      filename: minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
+      target_subdir: loras
+
+  # 選配：若需使用 4 步快速草圖抽卡、FP8 備援、首尾幀 FL2VA 或風格 Embedding，可取消對應註解
+  # optional_addons:
+  #   - name: minimax-h3-ref2v-turbo-4step-lora
+  #     repo_id: Comfy-Org/MiniMax-H3
+  #     filename: loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
+  #     target_subdir: loras
+  #     optional: true
+  #
+  #   - name: minimax-h3-ref2va-pruned-fp8-scaled
+  #     repo_id: Comfy-Org/MiniMax-H3
+  #     filename: diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors
+  #     target_subdir: diffusion_models
+  #     optional: true
+  #
+  #   - name: minimax-h3-fl2va-pruned-int8-convrot
+  #     repo_id: Comfy-Org/MiniMax-H3
+  #     filename: diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+  #     target_subdir: diffusion_models
+  #     optional: true
+  #
+  #   - name: minimax-h3-fl2v-turbo-8step-lora
+  #     repo_id: lightx2v/Minimax-h3-Turbo
+  #     filename: minimax_h3_fl2v_turbo_8step_v1.2_768p_comfyui_bf16.safetensors
+  #     target_subdir: loras
+  #     optional: true
+  #
+  #   - name: minimaxh3-bullet-time-embedding
+  #     repo_id: Comfy-Org/MiniMax-H3
+  #     filename: embeddings/minimaxh3_bullet_time.safetensors
+  #     target_subdir: embeddings
+  #     optional: true

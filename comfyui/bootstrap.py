@@ -129,10 +129,88 @@ MOSS_SFT_INT8_MODELS: tuple[ModelEntry, ...] = (
     ),
 )
 
+MINIMAX_H3_SHARED_BASE_MODELS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        name="qwen3vl-32b-minimax-h3-nvfp4-awq",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        target_subdir="text_encoders",
+    ),
+    ModelEntry(
+        name="minimax-h3-video-vae-fp16",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="vae/minimax_h3_video_vae_fp16.safetensors",
+        target_subdir="vae",
+    ),
+    ModelEntry(
+        name="minimax-h3-audio-vae-fp32",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="vae/minimax_h3_audio_vae_fp32.safetensors",
+        target_subdir="vae",
+    ),
+)
+
+MINIMAX_H3_REF2VA_8STEP_MODELS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        name="minimax-h3-ref2va-pruned-int8-convrot",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        target_subdir="diffusion_models",
+    ),
+    *MINIMAX_H3_SHARED_BASE_MODELS,
+    ModelEntry(
+        name="minimax-h3-ref2v-turbo-8step-lora",
+        repo_id="lightx2v/Minimax-h3-Turbo",
+        filename="minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        target_subdir="loras",
+    ),
+)
+
+MINIMAX_H3_REF2VA_8STEP_FP8_MODELS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        name="minimax-h3-ref2va-pruned-fp8-scaled",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
+        target_subdir="diffusion_models",
+    ),
+    *MINIMAX_H3_SHARED_BASE_MODELS,
+    MINIMAX_H3_REF2VA_8STEP_MODELS[-1],
+)
+
+MINIMAX_H3_REF2VA_FULL_MODELS: tuple[ModelEntry, ...] = (
+    *MINIMAX_H3_REF2VA_8STEP_MODELS,
+    ModelEntry(
+        name="minimax-h3-ref2v-turbo-4step-lora",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        target_subdir="loras",
+    ),
+)
+
+MINIMAX_H3_FL2VA_8STEP_MODELS: tuple[ModelEntry, ...] = (
+    ModelEntry(
+        name="minimax-h3-fl2va-pruned-int8-convrot",
+        repo_id="Comfy-Org/MiniMax-H3",
+        filename="diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        target_subdir="diffusion_models",
+    ),
+    *MINIMAX_H3_SHARED_BASE_MODELS,
+    ModelEntry(
+        name="minimax-h3-fl2v-turbo-8step-lora",
+        repo_id="lightx2v/Minimax-h3-Turbo",
+        filename="minimax_h3_fl2v_turbo_8step_v1.2_768p_comfyui_bf16.safetensors",
+        target_subdir="loras",
+    ),
+)
+
 MODEL_PRESETS: dict[str, tuple[ModelEntry, ...]] = {
     "qwen21_turbo_int8": QWEN21_TURBO_INT8_MODELS,
     "moss_sft_int8": MOSS_SFT_INT8_MODELS,
     "both": QWEN21_TURBO_INT8_MODELS + MOSS_SFT_INT8_MODELS,
+    "minimax_h3_ref2va_8step": MINIMAX_H3_REF2VA_8STEP_MODELS,
+    "minimax_h3_ref2va_8step_fp8": MINIMAX_H3_REF2VA_8STEP_FP8_MODELS,
+    "minimax_h3_ref2va_full": MINIMAX_H3_REF2VA_FULL_MODELS,
+    "minimax_h3_fl2va_8step": MINIMAX_H3_FL2VA_8STEP_MODELS,
 }
 
 
@@ -517,6 +595,37 @@ def prepare_zero_disk_dirs(shm_root: str | Path = DEFAULT_SHM_ROOT) -> dict[str,
     return {"output": out_dir, "temp": tmp_dir}
 
 
+def install_bundled_workflows(
+    comfy_dir: str | Path = DEFAULT_COMFY_DIR,
+    *,
+    workflows_src_dir: str | Path | None = None,
+    overwrite: bool = True,
+) -> list[Path]:
+    """Copy bundled ComfyUI workflow JSONs into ``<comfy_dir>/user/default/workflows``."""
+    src_dir = (
+        Path(workflows_src_dir)
+        if workflows_src_dir is not None
+        else Path(__file__).resolve().parent / "workflows"
+    )
+    if not src_dir.is_dir():
+        raise FileNotFoundError(f"Workflow source directory not found: {src_dir}")
+
+    dest_dir = Path(comfy_dir) / "user" / "default" / "workflows"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    installed: list[Path] = []
+    for src_file in sorted(src_dir.glob("*.json")):
+        if not src_file.is_file():
+            continue
+        dest_file = dest_dir / src_file.name
+        if dest_file.exists() and not overwrite:
+            installed.append(dest_file)
+            continue
+        shutil.copy2(src_file, dest_file)
+        installed.append(dest_file)
+    return installed
+
+
 def build_comfyui_command(
     comfy_dir: str | Path = DEFAULT_COMFY_DIR,
     *,
@@ -526,10 +635,13 @@ def build_comfyui_command(
     extra_args: Sequence[str] | None = None,
     python_bin: str = sys.executable,
     enable_compression: bool = True,
+    reserve_vram_gb: float | None = None,
 ) -> list[str]:
     """Build the ComfyUI launch command forcing output and temp into RAM disk."""
     if port <= 0 or port > 65535:
         raise ValueError(f"Invalid TCP port: {port}")
+    if reserve_vram_gb is not None and reserve_vram_gb < 0:
+        raise ValueError("reserve_vram_gb must be non-negative")
 
     dirs = prepare_zero_disk_dirs(shm_root)
     has_cors_arg = bool(
@@ -541,6 +653,13 @@ def build_comfyui_command(
     )
     has_compress_arg = bool(
         extra_args and "--enable-compress-response-body" in extra_args
+    )
+    has_reserve_vram_arg = bool(
+        extra_args
+        and any(
+            arg == "--reserve-vram" or arg.startswith("--reserve-vram=")
+            for arg in extra_args
+        )
     )
     cmd = [
         python_bin,
@@ -559,6 +678,8 @@ def build_comfyui_command(
         cmd.extend(["--enable-cors-header", "*"])
     if enable_compression and not has_compress_arg:
         cmd.append("--enable-compress-response-body")
+    if reserve_vram_gb is not None and reserve_vram_gb > 0 and not has_reserve_vram_arg:
+        cmd.extend(["--reserve-vram", f"{reserve_vram_gb:g}"])
     if extra_args:
         cmd.extend(extra_args)
     return cmd
@@ -705,6 +826,7 @@ def launch_comfyui_zero_disk(
     cloudflared_bin: str | None = None,
     tunnel_protocol: str | None = DEFAULT_TUNNEL_PROTOCOL,
     enable_compression: bool = True,
+    reserve_vram_gb: float | None = None,
 ) -> ZeroDiskLaunchResult:
     """Start ComfyUI in zero-disk mode, prune RAM outputs periodically, and expose via tunnel."""
     normalized_protocol = normalize_tunnel_protocol(tunnel_protocol)
@@ -719,6 +841,7 @@ def launch_comfyui_zero_disk(
         extra_args=extra_args,
         python_bin=python_bin,
         enable_compression=enable_compression,
+        reserve_vram_gb=reserve_vram_gb,
     )
     reaper_stop, _ = start_ramdisk_reaper(
         (dirs["output"], dirs["temp"]),
